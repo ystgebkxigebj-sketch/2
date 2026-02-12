@@ -29,7 +29,7 @@ jobs:
               "https://addons.mozilla.org/firefox/downloads/latest/ublock-origin/latest.xpi",
               "https://addons.mozilla.org/firefox/downloads/latest/auto-refresh-page/latest.xpi",
               "https://addons.mozilla.org/firefox/downloads/latest/multi-account-containers/latest.xpi",
-              "https://addons.mozilla.org/firefox/downloads/latest/tampermonkey/latest.xpi"
+              "https://addons.mozilla.org/firefox/downloads/latest/violentmonkey/latest.xpi"
           )
 
           $policies = @{
@@ -37,10 +37,6 @@ jobs:
                   Extensions = @{ Install = $extensions }
                   DisableAppUpdate = $true
                   DontCheckDefaultBrowser = $true
-                  Homepage = @{
-                      URL = "https://gartic.io"
-                      StartPage = "homepage"
-                  }
               }
           }
           $policies | ConvertTo-Json -Depth 4 | Out-File "$distDir\policies.json" -Encoding UTF8
@@ -53,9 +49,6 @@ jobs:
           New-LocalUser -Name "YOU" -Password $securePass -AccountNeverExpires -ErrorAction SilentlyContinue
           Add-LocalGroupMember -Group "Administrators" -Member "YOU"
           Add-LocalGroupMember -Group "Remote Desktop Users" -Member "YOU"
-          
-          echo "RDP_USER=YOU" >> $env:GITHUB_ENV
-          echo "RDP_PASS=$password" >> $env:GITHUB_ENV
 
       - name: 5. Start Tailscale
         run: |
@@ -64,123 +57,49 @@ jobs:
           Start-Process "$env:TEMP\tailscale.exe" -ArgumentList "/quiet", "/norestart" -Wait
           & "C:\Program Files\Tailscale\tailscale.exe" up --authkey=${{ secrets.TAILSCALE_AUTH_KEY }} --hostname=gartic-max-ram
 
-      - name: 6. Install Userscript + Launch Tabs
+      - name: 6. Setup Auto-Start Script
         run: |
           $ip = & "C:\Program Files\Tailscale\tailscale.exe" ip -4
           echo "::notice title=RDP CONNECT INFO::IP: $ip | User: YOU | Pass: Start@123456"
 
-          # --- AUTO-INSTALL USERSCRIPT INTO TAMPERMONKEY ---
+          # Create a PowerShell script that runs on user login
+          # This script installs the userscript and opens gartic tabs
           
-          # Find the Tampermonkey profile directory
-          # First launch Firefox briefly to create the profile
-          $firefoxProc = Start-Process "C:\Program Files\Mozilla Firefox\firefox.exe" -ArgumentList "-headless" -PassThru
-          Start-Sleep -Seconds 15
-          Stop-Process -Id $firefoxProc.Id -Force -ErrorAction SilentlyContinue
+          $startupScript = @'
+          # Wait for desktop to be ready
+          Start-Sleep -Seconds 5
+
+          # CHANGE THIS to your raw userscript URL
+          $userscriptUrl = "https://github.com/ystgebkxigebj-sketch/1/raw/refs/heads/main/.github/gartic-token.user.js"
+
+          # Open Firefox with userscript install page first, then gartic tabs
+          # ViolentMonkey auto-detects .user.js URLs and prompts install
+          $firefox = "C:\Program Files\Mozilla Firefox\firefox.exe"
+          
+          Start-Process $firefox -ArgumentList $userscriptUrl
           Start-Sleep -Seconds 3
-
-          # Find the Firefox profile folder
-          $profilesDir = "$env:APPDATA\Mozilla\Firefox\Profiles"
-          $profilePath = Get-ChildItem $profilesDir -Directory | Select-Object -First 1
-
-          if ($profilePath) {
-              Write-Host "Firefox profile found: $($profilePath.FullName)"
-              
-              # Find Tampermonkey extension storage
-              # Tampermonkey stores scripts in the browser extension storage
-              # We'll use a different approach: create a script file and use Firefox autoconfig
-              
-              # Create the userscript file
-              $userscript = @'
-          // ==UserScript==
-          // @name         Gartic.io Token Fetcher (RDP Optimized)
-          // @namespace    http://tampermonkey.net/
-          // @version      3.0
-          // @description  Fetch maximum tokens from Turnstile with auto reload
-          // @author       You
-          // @match        *://gartic.io/*
-          // @match        *://*.gartic.io/*
-          // @grant        none
-          // ==/UserScript==
-          (function () {
-              'use strict';
-              const TOKEN_INTERVAL = 4000;
-              const NUM_IFRAMES = 6;
-              const BACKEND_URL = 'https://moonfive.alwaysdata.net/add-token';
-
-              setInterval(() => { location.reload(); }, 30000);
-
-              function sendToken(token) {
-                  if (typeof token !== 'string' || token.length <= 20) return;
-                  console.log("Token received:", token);
-                  fetch(BACKEND_URL, {
-                      method: 'POST',
-                      headers: { 'Content-Type': 'application/json' },
-                      body: JSON.stringify({ token })
-                  }).catch(() => {});
-              }
-
-              function createTurnstileFrames() {
-                  window.addEventListener('message', function(event) {
-                      if (event.data && typeof event.data === 'string') {
-                          sendToken(event.data);
-                      }
-                  });
-                  for (let i = 0; i < NUM_IFRAMES; i++) {
-                      const iframe = document.createElement('iframe');
-                      iframe.style.display = 'none';
-                      iframe.sandbox = 'allow-scripts allow-same-origin';
-                      document.body.appendChild(iframe);
-                      iframe.srcdoc = `<!DOCTYPE html>
-          <html><head>
-          <script src="https://challenges.cloudflare.com/turnstile/v0/api.js" async defer><\/script>
-          </head><body>
-          <div id="cf-turnstile"></div>
-          <script>
-          function requestToken() {
-              try {
-                  window.turnstile.render('#cf-turnstile', {
-                      sitekey: '0x4AAAAAABBPKaIbNwnPEfSo',
-                      callback: function(token) { parent.postMessage(token, '*'); }
-                  });
-              } catch (e) {}
+          
+          # Open 6 gartic.io tabs
+          for ($i = 0; $i -lt 6; $i++) {
+              Start-Process $firefox -ArgumentList "-new-tab", "https://gartic.io/"
+              Start-Sleep -Milliseconds 500
           }
-          setInterval(requestToken, ${TOKEN_INTERVAL});
-          setTimeout(requestToken, 200);
-          <\/script></body></html>`;
-                  }
-              }
-              createTurnstileFrames();
-          })();
           '@
+          
+          # Save the startup script
+          $startupPath = "C:\Users\Public\start-gartic.ps1"
+          $startupScript | Out-File $startupPath -Encoding UTF8
+          
+          # Create a batch file in the Startup folder for ALL users
+          # This runs when anyone logs in via RDP
+          $allUsersStartup = "C:\ProgramData\Microsoft\Windows\Start Menu\Programs\Startup"
+          $batContent = '@echo off' + "`r`n" + 'powershell -ExecutionPolicy Bypass -File "C:\Users\Public\start-gartic.ps1"'
+          $batContent | Out-File "$allUsersStartup\gartic-autostart.bat" -Encoding ASCII
+          
+          Write-Host "Auto-start configured! Firefox will launch on RDP login."
+          Write-Host "Userscript URL: will open in ViolentMonkey for install"
 
-              # Save userscript to a known location
-              $scriptPath = "C:\userscript.user.js"
-              $userscript | Out-File $scriptPath -Encoding UTF8
-              Write-Host "Userscript saved to $scriptPath"
-
-              # Method: Open Firefox with the userscript file URL
-              # Tampermonkey will detect .user.js and prompt to install
-              # We open it as a file:// URL which Tampermonkey auto-detects
-              
-              # Also open gartic.io tabs
-              $tabs = @(
-                  "file:///$($scriptPath -replace '\\','/')",
-                  "https://gartic.io/",
-                  "https://gartic.io/",
-                  "https://gartic.io/",
-                  "https://gartic.io/",
-                  "https://gartic.io/",
-                  "https://gartic.io/"
-              )
-
-              # Launch Firefox with all tabs
-              $allUrls = $tabs -join " "
-              Start-Process "C:\Program Files\Mozilla Firefox\firefox.exe" -ArgumentList $allUrls
-              Write-Host "Firefox launched with userscript installer + 6 gartic tabs"
-          } else {
-              Write-Host "WARNING: No Firefox profile found, launching Firefox normally"
-              Start-Process "C:\Program Files\Mozilla Firefox\firefox.exe"
-          }
-
-          Write-Host "RDP Ready with MAX Virtual RAM!"
+      - name: 7. Keep Alive
+        run: |
+          Write-Host "RDP Ready! Waiting for connection..."
           while ($true) { Start-Sleep -Seconds 300 }
