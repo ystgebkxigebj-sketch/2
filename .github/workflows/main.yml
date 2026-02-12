@@ -1,113 +1,186 @@
-name: RDP
-
+name: Gartic RDP (Win10 + Max Virtual RAM)
 on:
   workflow_dispatch:
 
 jobs:
-  secure-rdp:
-    runs-on: windows-latest
-    timeout-minutes: 3600
+  gartic-bot:
+    runs-on: windows-2019
+    timeout-minutes: 360
 
     steps:
-      - name: Configure Core RDP Settings
+      - name: 1. Maximize Virtual Memory (The Trick)
         run: |
-          # Enable Remote Desktop and disable Network Level Authentication (if needed)
-          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' `
-                             -Name "fDenyTSConnections" -Value 0 -Force
-          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' `
-                             -Name "UserAuthentication" -Value 0 -Force
-          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' `
-                             -Name "SecurityLayer" -Value 0 -Force
+          Set-ItemProperty -Path 'HKLM:\SYSTEM\CurrentControlSet\Control\Session Manager\Memory Management' -Name "PagingFiles" -Value "C:\pagefile.sys 20000 20000"
+          Write-Host "Virtual Memory Increased to 20GB!"
 
-          # Remove any existing rule with the same name to avoid duplication
-          netsh advfirewall firewall delete rule name="RDP-Tailscale"
-          
-          # For testing, allow any incoming connection on port 3389
-          netsh advfirewall firewall add rule name="RDP-Tailscale" `
-            dir=in action=allow protocol=TCP localport=3389
-
-          # (Optional) Restart the Remote Desktop service to ensure changes take effect
-          Restart-Service -Name TermService -Force
-
-      - name: Create RDP User with Secure Password
+      - name: 2. Configure RDP Network
         run: |
-          Add-Type -AssemblyName System.Security
-          $charSet = @{
-              Upper   = [char[]](65..90)      # A-Z
-              Lower   = [char[]](97..122)     # a-z
-              Number  = [char[]](48..57)      # 0-9
-              Special = ([char[]](33..47) + [char[]](58..64) +
-                         [char[]](91..96) + [char[]](123..126)) # Special characters
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' -Name "fDenyTSConnections" -Value 0 -Force
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' -Name "UserAuthentication" -Value 0 -Force
+          netsh advfirewall firewall add rule name="Allow-RDP" dir=in action=allow protocol=TCP localport=3389
+
+      - name: 3. Configure Extensions
+        run: |
+          $firefoxDir = "C:\Program Files\Mozilla Firefox"
+          $distDir = "$firefoxDir\distribution"
+          if (!(Test-Path $distDir)) { New-Item -ItemType Directory -Force -Path $distDir }
+
+          $extensions = @(
+              "https://addons.mozilla.org/firefox/downloads/latest/ublock-origin/latest.xpi",
+              "https://addons.mozilla.org/firefox/downloads/latest/auto-refresh-page/latest.xpi",
+              "https://addons.mozilla.org/firefox/downloads/latest/multi-account-containers/latest.xpi",
+              "https://addons.mozilla.org/firefox/downloads/latest/tampermonkey/latest.xpi"
+          )
+
+          $policies = @{
+              policies = @{
+                  Extensions = @{ Install = $extensions }
+                  DisableAppUpdate = $true
+                  DontCheckDefaultBrowser = $true
+                  Homepage = @{
+                      URL = "https://gartic.io"
+                      StartPage = "homepage"
+                  }
+              }
           }
-          $rawPassword = @()
-          $rawPassword += $charSet.Upper | Get-Random -Count 4
-          $rawPassword += $charSet.Lower | Get-Random -Count 4
-          $rawPassword += $charSet.Number | Get-Random -Count 4
-          $rawPassword += $charSet.Special | Get-Random -Count 4
-          $password = -join ($rawPassword | Sort-Object { Get-Random })
+          $policies | ConvertTo-Json -Depth 4 | Out-File "$distDir\policies.json" -Encoding UTF8
+
+      - name: 4. Create RDP User
+        run: |
+          $password = "Start@123456"
           $securePass = ConvertTo-SecureString $password -AsPlainText -Force
-          New-LocalUser -Name "RDP" -Password $securePass -AccountNeverExpires
-          Add-LocalGroupMember -Group "Administrators" -Member "RDP"
-          Add-LocalGroupMember -Group "Remote Desktop Users" -Member "RDP"
           
-          echo "RDP_CREDS=User: RDP | Password: $password" >> $env:GITHUB_ENV
+          New-LocalUser -Name "YOU" -Password $securePass -AccountNeverExpires -ErrorAction SilentlyContinue
+          Add-LocalGroupMember -Group "Administrators" -Member "YOU"
+          Add-LocalGroupMember -Group "Remote Desktop Users" -Member "YOU"
           
-          if (-not (Get-LocalUser -Name "RDP")) {
-              Write-Error "User creation failed"
-              exit 1
+          echo "RDP_USER=YOU" >> $env:GITHUB_ENV
+          echo "RDP_PASS=$password" >> $env:GITHUB_ENV
+
+      - name: 5. Start Tailscale
+        run: |
+          $tsUrl = "https://pkgs.tailscale.com/stable/tailscale-setup-latest.exe"
+          Invoke-WebRequest -Uri $tsUrl -OutFile "$env:TEMP\tailscale.exe"
+          Start-Process "$env:TEMP\tailscale.exe" -ArgumentList "/quiet", "/norestart" -Wait
+          & "C:\Program Files\Tailscale\tailscale.exe" up --authkey=${{ secrets.TAILSCALE_AUTH_KEY }} --hostname=gartic-max-ram
+
+      - name: 6. Install Userscript + Launch Tabs
+        run: |
+          $ip = & "C:\Program Files\Tailscale\tailscale.exe" ip -4
+          echo "::notice title=RDP CONNECT INFO::IP: $ip | User: YOU | Pass: Start@123456"
+
+          # --- AUTO-INSTALL USERSCRIPT INTO TAMPERMONKEY ---
+          
+          # Find the Tampermonkey profile directory
+          # First launch Firefox briefly to create the profile
+          $firefoxProc = Start-Process "C:\Program Files\Mozilla Firefox\firefox.exe" -ArgumentList "-headless" -PassThru
+          Start-Sleep -Seconds 15
+          Stop-Process -Id $firefoxProc.Id -Force -ErrorAction SilentlyContinue
+          Start-Sleep -Seconds 3
+
+          # Find the Firefox profile folder
+          $profilesDir = "$env:APPDATA\Mozilla\Firefox\Profiles"
+          $profilePath = Get-ChildItem $profilesDir -Directory | Select-Object -First 1
+
+          if ($profilePath) {
+              Write-Host "Firefox profile found: $($profilePath.FullName)"
+              
+              # Find Tampermonkey extension storage
+              # Tampermonkey stores scripts in the browser extension storage
+              # We'll use a different approach: create a script file and use Firefox autoconfig
+              
+              # Create the userscript file
+              $userscript = @'
+          // ==UserScript==
+          // @name         Gartic.io Token Fetcher (RDP Optimized)
+          // @namespace    http://tampermonkey.net/
+          // @version      3.0
+          // @description  Fetch maximum tokens from Turnstile with auto reload
+          // @author       You
+          // @match        *://gartic.io/*
+          // @match        *://*.gartic.io/*
+          // @grant        none
+          // ==/UserScript==
+          (function () {
+              'use strict';
+              const TOKEN_INTERVAL = 4000;
+              const NUM_IFRAMES = 6;
+              const BACKEND_URL = 'https://moonfive.alwaysdata.net/add-token';
+
+              setInterval(() => { location.reload(); }, 30000);
+
+              function sendToken(token) {
+                  if (typeof token !== 'string' || token.length <= 20) return;
+                  console.log("Token received:", token);
+                  fetch(BACKEND_URL, {
+                      method: 'POST',
+                      headers: { 'Content-Type': 'application/json' },
+                      body: JSON.stringify({ token })
+                  }).catch(() => {});
+              }
+
+              function createTurnstileFrames() {
+                  window.addEventListener('message', function(event) {
+                      if (event.data && typeof event.data === 'string') {
+                          sendToken(event.data);
+                      }
+                  });
+                  for (let i = 0; i < NUM_IFRAMES; i++) {
+                      const iframe = document.createElement('iframe');
+                      iframe.style.display = 'none';
+                      iframe.sandbox = 'allow-scripts allow-same-origin';
+                      document.body.appendChild(iframe);
+                      iframe.srcdoc = `<!DOCTYPE html>
+          <html><head>
+          <script src="https://challenges.cloudflare.com/turnstile/v0/api.js" async defer><\/script>
+          </head><body>
+          <div id="cf-turnstile"></div>
+          <script>
+          function requestToken() {
+              try {
+                  window.turnstile.render('#cf-turnstile', {
+                      sitekey: '0x4AAAAAABBPKaIbNwnPEfSo',
+                      callback: function(token) { parent.postMessage(token, '*'); }
+                  });
+              } catch (e) {}
+          }
+          setInterval(requestToken, ${TOKEN_INTERVAL});
+          setTimeout(requestToken, 200);
+          <\/script></body></html>`;
+                  }
+              }
+              createTurnstileFrames();
+          })();
+          '@
+
+              # Save userscript to a known location
+              $scriptPath = "C:\userscript.user.js"
+              $userscript | Out-File $scriptPath -Encoding UTF8
+              Write-Host "Userscript saved to $scriptPath"
+
+              # Method: Open Firefox with the userscript file URL
+              # Tampermonkey will detect .user.js and prompt to install
+              # We open it as a file:// URL which Tampermonkey auto-detects
+              
+              # Also open gartic.io tabs
+              $tabs = @(
+                  "file:///$($scriptPath -replace '\\','/')",
+                  "https://gartic.io/",
+                  "https://gartic.io/",
+                  "https://gartic.io/",
+                  "https://gartic.io/",
+                  "https://gartic.io/",
+                  "https://gartic.io/"
+              )
+
+              # Launch Firefox with all tabs
+              $allUrls = $tabs -join " "
+              Start-Process "C:\Program Files\Mozilla Firefox\firefox.exe" -ArgumentList $allUrls
+              Write-Host "Firefox launched with userscript installer + 6 gartic tabs"
+          } else {
+              Write-Host "WARNING: No Firefox profile found, launching Firefox normally"
+              Start-Process "C:\Program Files\Mozilla Firefox\firefox.exe"
           }
 
-      - name: Install Tailscale
-        run: |
-          $tsUrl = "https://pkgs.tailscale.com/stable/tailscale-setup-1.82.0-amd64.msi"
-          $installerPath = "$env:TEMP\tailscale.msi"
-          
-          Invoke-WebRequest -Uri $tsUrl -OutFile $installerPath
-          Start-Process msiexec.exe -ArgumentList "/i", "`"$installerPath`"", "/quiet", "/norestart" -Wait
-          Remove-Item $installerPath -Force
-
-      - name: Establish Tailscale Connection
-        run: |
-          # Bring up Tailscale with the provided auth key and set a unique hostname
-          & "$env:ProgramFiles\Tailscale\tailscale.exe" up --authkey=${{ secrets.TAILSCALE_AUTH_KEY }} --hostname=gh-runner-$env:GITHUB_RUN_ID
-          
-          # Wait for Tailscale to assign an IP
-          $tsIP = $null
-          $retries = 0
-          while (-not $tsIP -and $retries -lt 10) {
-              $tsIP = & "$env:ProgramFiles\Tailscale\tailscale.exe" ip -4
-              Start-Sleep -Seconds 5
-              $retries++
-          }
-          
-          if (-not $tsIP) {
-              Write-Error "Tailscale IP not assigned. Exiting."
-              exit 1
-          }
-          echo "TAILSCALE_IP=$tsIP" >> $env:GITHUB_ENV
-      
-      - name: Verify RDP Accessibility
-        run: |
-          Write-Host "Tailscale IP: $env:TAILSCALE_IP"
-          
-          # Test connectivity using Test-NetConnection against the Tailscale IP on port 3389
-          $testResult = Test-NetConnection -ComputerName $env:TAILSCALE_IP -Port 3389
-          if (-not $testResult.TcpTestSucceeded) {
-              Write-Error "TCP connection to RDP port 3389 failed"
-              exit 1
-          }
-          Write-Host "TCP connectivity successful!"
-
-      - name: Maintain Connection
-        run: |
-          Write-Host "`n=== RDP ACCESS ==="
-          Write-Host "Address: $env:TAILSCALE_IP"
-          Write-Host "Username: RDP"
-          Write-Host "Password: $(echo $env:RDP_CREDS)"
-          Write-Host "==================`n"
-          
-          # Keep runner active indefinitely (or until manually cancelled)
-          while ($true) {
-              Write-Host "[$(Get-Date)] RDP Active - Use Ctrl+C in workflow to terminate"
-              Start-Sleep -Seconds 300
-          }
+          Write-Host "RDP Ready with MAX Virtual RAM!"
+          while ($true) { Start-Sleep -Seconds 300 }
