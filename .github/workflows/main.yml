@@ -1,25 +1,23 @@
-name: Gartic RDP (Win10 + Max Virtual RAM)
+name: 1234
+
 on:
-  workflow_dispatch:
+  workflow_dispatch:      # عشان تشغله يدوي لو حبيت
+  schedule:
+    - cron: '0 */6 * * *' # ده السطر السحري: هيشتغل لوحده كل 6 ساعات
 
 jobs:
   gartic-bot:
     runs-on: windows-2019
-    timeout-minutes: 360
+    timeout-minutes: 360  # 6 ساعات
 
     steps:
-      - name: 1. Maximize Virtual Memory (The Trick)
-        run: |
-          Set-ItemProperty -Path 'HKLM:\SYSTEM\CurrentControlSet\Control\Session Manager\Memory Management' -Name "PagingFiles" -Value "C:\pagefile.sys 20000 20000"
-          Write-Host "Virtual Memory Increased to 20GB!"
-
-      - name: 2. Configure RDP Network
+      - name: 1. Configure RDP Network
         run: |
           Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' -Name "fDenyTSConnections" -Value 0 -Force
           Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' -Name "UserAuthentication" -Value 0 -Force
           netsh advfirewall firewall add rule name="Allow-RDP" dir=in action=allow protocol=TCP localport=3389
 
-      - name: 3. Configure Extensions
+      - name: 2. Configure Extensions (No Install Needed)
         run: |
           $firefoxDir = "C:\Program Files\Mozilla Firefox"
           $distDir = "$firefoxDir\distribution"
@@ -37,11 +35,15 @@ jobs:
                   Extensions = @{ Install = $extensions }
                   DisableAppUpdate = $true
                   DontCheckDefaultBrowser = $true
+                  Homepage = @{
+                      URL = "https://gartic.io"
+                      StartPage = "homepage"
+                  }
               }
           }
           $policies | ConvertTo-Json -Depth 4 | Out-File "$distDir\policies.json" -Encoding UTF8
 
-      - name: 4. Create RDP User
+      - name: 3. Create RDP User
         run: |
           $password = "Start@123456"
           $securePass = ConvertTo-SecureString $password -AsPlainText -Force
@@ -49,48 +51,23 @@ jobs:
           New-LocalUser -Name "YOU" -Password $securePass -AccountNeverExpires -ErrorAction SilentlyContinue
           Add-LocalGroupMember -Group "Administrators" -Member "YOU"
           Add-LocalGroupMember -Group "Remote Desktop Users" -Member "YOU"
+          
+          echo "RDP_USER=YOU" >> $env:GITHUB_ENV
+          echo "RDP_PASS=$password" >> $env:GITHUB_ENV
 
-      - name: 5. Start Tailscale
+      - name: 4. Start Tailscale
         run: |
           $tsUrl = "https://pkgs.tailscale.com/stable/tailscale-setup-latest.exe"
           Invoke-WebRequest -Uri $tsUrl -OutFile "$env:TEMP\tailscale.exe"
           Start-Process "$env:TEMP\tailscale.exe" -ArgumentList "/quiet", "/norestart" -Wait
-          & "C:\Program Files\Tailscale\tailscale.exe" up --authkey=${{ secrets.TAILSCALE_AUTH_KEY }} --hostname=gartic-max-ram
+          & "C:\Program Files\Tailscale\tailscale.exe" up --authkey=${{ secrets.TAILSCALE_AUTH_KEY }} --hostname=gartic-fast
 
-      - name: 6. Launch Firefox with Userscript + Tabs
+      - name: 5. Launch Firefox
         run: |
           $ip = & "C:\Program Files\Tailscale\tailscale.exe" ip -4
           echo "::notice title=RDP CONNECT INFO::IP: $ip | User: YOU | Pass: Start@123456"
-
-          $firefox = "C:\Program Files\Mozilla Firefox\firefox.exe"
-          $scriptUrl = "https://github.com/ystgebkxigebj-sketch/1/raw/refs/heads/main/.github/gartic-token.user.js"
-
-          # First launch Firefox to initialize profile + extensions
-          Write-Host "Launching Firefox to initialize..."
-          $proc = Start-Process $firefox -ArgumentList "-headless" -PassThru
-          Start-Sleep -Seconds 20
-          Stop-Process -Id $proc.Id -Force -ErrorAction SilentlyContinue
-          Start-Sleep -Seconds 5
-          Write-Host "Firefox initialized."
-
-          # Now launch Firefox with the userscript URL + gartic tabs
-          # This runs in the SYSTEM session, visible when you RDP in
-          Write-Host "Launching Firefox with tabs..."
-          Start-Process $firefox -ArgumentList "$scriptUrl"
-          Start-Sleep -Seconds 3
-          Start-Process $firefox -ArgumentList "-new-tab", "https://gartic.io/"
-          Start-Sleep -Seconds 1
-          Start-Process $firefox -ArgumentList "-new-tab", "https://gartic.io/"
-          Start-Sleep -Seconds 1
-          Start-Process $firefox -ArgumentList "-new-tab", "https://gartic.io/"
-          Start-Sleep -Seconds 1
-          Start-Process $firefox -ArgumentList "-new-tab", "https://gartic.io/"
-          Start-Sleep -Seconds 1
-          Start-Process $firefox -ArgumentList "-new-tab", "https://gartic.io/"
-          Start-Sleep -Seconds 1
-          Start-Process $firefox -ArgumentList "-new-tab", "https://gartic.io/"
-
-          Write-Host "Firefox launched with userscript + 6 gartic tabs!"
-          Write-Host "RDP Ready!"
-
+          
+          Start-Process "C:\Program Files\Mozilla Firefox\firefox.exe"
+          
+          Write-Host "RDP Ready! Will restart automatically every 6 hours."
           while ($true) { Start-Sleep -Seconds 300 }
