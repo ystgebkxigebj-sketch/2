@@ -88,6 +88,12 @@ errors, and the expected loopback source. A read-only 15-minute journal audit
 showed 52 confirmed Gartic event-5 joins, zero code-5 rejections, zero
 missing-token aborts, zero panics, and 330 expected code-3 room-full responses.
 Both `tunnel-relay` and `icebot` were active; Icebot had zero service restarts.
+Later session churn briefly exposed one under-target auto-rejoining room. In a
+46-second observation it settled at its current 5/5 target while Icebot made 43
+additional successful token pulls; null and error counters did not change. The
+final whole-fleet snapshot was 53/53 configured bots across 11 dynamic sessions,
+with zero under-target rooms, 5,034 successful token pulls, and zero fetch
+errors. This proves recovery consumption, not merely producer-side delivery.
 
 ## Reproduction artifacts
 
