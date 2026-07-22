@@ -102,7 +102,7 @@ jobs:
           python --version
           python -m camoufox version
           "$HOME/.cache/camoufox/camoufox-bin" --version
-          python -c 'import camoufox, playwright; print("imports=ok")'
+          python -c 'import camoufox, geoip2, playwright; print("imports=ok")'
 
       - name: Run headless generator
         id: generator
