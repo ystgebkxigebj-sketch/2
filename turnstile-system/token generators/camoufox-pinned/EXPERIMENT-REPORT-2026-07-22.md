@@ -60,14 +60,40 @@ local diagnostic matrix:
 
 The workflow was parsed, checked by actionlint 1.7.12 with no findings, and all
 Python files compiled successfully. The workflow-master unit suite passes four
-tests. A live GitHub-hosted run remains the final environment-specific check;
-the workflow deliberately requires a proxy because hosted-runner datacenter IPs
-have historically produced Cloudflare 600010.
+tests. The first live GitHub smoke run exposed one package omission before
+scaling: `camoufox==0.4.11` did not install the GeoIP extra required when a proxy
+is supplied. It produced no token attempts. The pin was corrected to
+`camoufox[geoip]==0.4.11` and the workflow now preflights the `geoip2` import.
+
+On fixed commit `5a79331`, slot 0 produced 66 level-1 callbacks in about two
+minutes and had acknowledged 65 relay posts at its final log line. Slot 1,
+using a different selected proxy, produced 282 callbacks and had acknowledged
+281 posts at its final line. Both samples had zero Turnstile, relay, and GeoIP
+errors. The master then established 20 unique producer slots without exceeding
+20 active/queued runs. The account admitted four hosted jobs concurrently and
+kept the remaining slots queued; the per-slot self-chain and five-minute
+supervisor preserve all slot identities as capacity rotates.
+
+## Production integration verification
+
+The new producers post directly to the existing Oracle relay at `/add`; no
+additional relay hop was added. The deployed Icebot reports persistent
+`ICEBOT_JOIN_MODE=token` and consumes from the loopback-only
+`http://localhost:8091/assign` path in `tunnel system/relay`.
+
+During live verification, the GitHub fleet added 103 relay tokens in 25.6
+seconds while the Icebot fleet remained fully populated at 127/127 bots. The
+Icebot service reported 8,069 token fetches, 4,495 successful pulls, zero fetch
+errors, and the expected loopback source. A read-only 15-minute journal audit
+showed 52 confirmed Gartic event-5 joins, zero code-5 rejections, zero
+missing-token aborts, zero panics, and 330 expected code-3 room-full responses.
+Both `tunnel-relay` and `icebot` were active; Icebot had zero service restarts.
 
 ## Reproduction artifacts
 
 - Deployable package: `turnstile-system/token generators/camoufox-pinned/`
 - Workflow: `.github/workflows/gartic-camoufox-pinned.yml`
+- Supervisor: `.github/workflows/camoufox-supervisor.yml`
 - Local one-shot harness: `oracle server/_diag/camoufox-token-loop/trial.py`
 - Redacted structured results: `oracle server/_diag/camoufox-token-loop/results.jsonl`
 - Isolated local browser: `oracle server/_diag/camoufox-token-loop/browsers/v135.0.1-beta.24-win.x86_64/`

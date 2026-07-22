@@ -9,6 +9,7 @@ runner datacenter IPs have previously returned Cloudflare error `600010`.
 ## Repository files
 
 - `.github/workflows/gartic-camoufox-pinned.yml`
+- `.github/workflows/camoufox-supervisor.yml`
 - `turnstile-system/token generators/camoufox-pinned/generator.py`
 - `turnstile-system/token generators/camoufox-pinned/requirements.txt`
 - `turnstile-system/token generators/camoufox-pinned/workflow_master.py`
@@ -31,7 +32,13 @@ asset against SHA-256
 runs headlessly for 330 minutes. It then dispatches the same numbered slot's
 successor. A per-slot concurrency group prevents duplicates.
 
-## Bootstrap and supervise
+The supervisor workflow runs every five minutes and executes the same tested
+master planner inside GitHub with `github.token`. It refills only missing slots,
+counts queued jobs toward the 20-run ceiling, and needs no always-on PC or
+personal access token. The per-slot self-chain remains the fast handoff path;
+the supervisor is its recovery layer.
+
+## Bootstrap and supervise manually
 
 Create a fine-grained GitHub token that can read and write Actions for the
 repository, then expose it only in the master process environment:
@@ -59,10 +66,12 @@ python "turnstile-system/token generators/camoufox-pinned/workflow_master.py" `
 Continuous mode polls every 60 seconds. It recognizes active runs by their
 `Camoufox slot N` run title and dispatches only absent slots. It counts any
 unnamed active run against the target, so it cannot knowingly exceed 20. Keep
-the master in `tmux`, a Windows Scheduled Task, or a supervised service.
+the master in `tmux`, a Windows Scheduled Task, or a supervised service only if
+you want faster-than-five-minute external reconciliation.
 
-Stop it with Ctrl+C. The producer runs already in GitHub continue and normally
-self-chain; cancel those from the Actions page when you want generation to end.
+To stop generation, disable `Camoufox Fleet Supervisor` first, then cancel the
+producer runs. Otherwise the next scheduled supervisor pass intentionally
+restores missing slots. A local continuous master stops with Ctrl+C.
 
 GitHub Free currently permits 20 concurrent standard hosted jobs, but private
 repositories also have a monthly Actions-minute allowance. Check the account's

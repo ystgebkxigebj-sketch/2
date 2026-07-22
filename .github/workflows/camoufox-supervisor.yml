@@ -1,0 +1,37 @@
+name: Camoufox Fleet Supervisor
+run-name: Camoufox supervisor
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "*/5 * * * *"
+
+permissions:
+  actions: write
+  contents: read
+
+concurrency:
+  group: camoufox-fleet-supervisor
+  cancel-in-progress: true
+
+jobs:
+  reconcile:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    env:
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Refill missing producer slots
+        shell: bash
+        run: |
+          python3 'turnstile-system/token generators/camoufox-pinned/workflow_master.py' \
+            --repo "$GITHUB_REPOSITORY" \
+            --workflow gartic-camoufox-pinned.yml \
+            --target 20 \
+            --runtime-minutes 330 \
+            --poll-seconds 60 \
+            --once \
+            --lock-file /tmp/camoufox-supervisor.lock
