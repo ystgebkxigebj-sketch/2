@@ -1,0 +1,133 @@
+name: Gartic Camoufox Pinned 135
+run-name: Camoufox slot ${{ inputs.slot }}
+
+on:
+  workflow_dispatch:
+    inputs:
+      slot:
+        description: Stable producer slot number (0-19 on GitHub Free)
+        required: true
+        default: "0"
+      runtime_minutes:
+        description: Generator runtime before clean successor handoff
+        required: true
+        default: "330"
+
+permissions:
+  actions: write
+  contents: read
+
+concurrency:
+  group: camoufox-pinned-slot-${{ inputs.slot }}
+  cancel-in-progress: false
+
+jobs:
+  generate:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 355
+    env:
+      PYTHONUNBUFFERED: "1"
+      REQUIRE_PROXY: "1"
+      NUM_TABS: "1"
+      NUM_LANES: "1"
+      MAX_RUNTIME_MINUTES: ${{ inputs.runtime_minutes }}
+      AUTH_SECRET: ${{ secrets.CAMOUFOX_AUTH_SECRET }}
+      CAMOUFOX_PROXIES: ${{ secrets.CAMOUFOX_PROXIES }}
+      RELAY_URL: ${{ vars.CAMOUFOX_RELAY_URL }}
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Select and mask this slot's proxy
+        shell: bash
+        run: |
+          set -euo pipefail
+          mapfile -t proxies < <(printf '%s\n' "$CAMOUFOX_PROXIES" | sed '/^[[:space:]]*$/d')
+          if (( ${#proxies[@]} == 0 )); then
+            echo "CAMOUFOX_PROXIES is empty" >&2
+            exit 1
+          fi
+          index=$(( (10#${{ inputs.slot }} + GITHUB_RUN_NUMBER) % ${#proxies[@]} ))
+          selected="${proxies[$index]}"
+          echo "::add-mask::$selected"
+          echo "PROXY=$selected" >> "$GITHUB_ENV"
+          echo "proxy_count=${#proxies[@]} selected_index=$index"
+
+      - name: Install Python 3.9.25
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.9.25"
+          cache: pip
+          cache-dependency-path: "turnstile-system/token generators/camoufox-pinned/requirements.txt"
+
+      - name: Install Firefox runtime libraries
+        shell: bash
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends \
+            libasound2t64 libdbus-glib-1-2 libgbm1 libgtk-3-0 libnss3 \
+            libx11-xcb1 libxcomposite1 libxcursor1 libxdamage1 libxfixes3 \
+            libxi6 libxrandr2 libxrender1 libxss1 libxt6 libxtst6 \
+            fonts-liberation unzip
+
+      - name: Restore pinned Camoufox browser cache
+        id: browser-cache
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/camoufox
+          key: camoufox-135.0.1-beta.24-lin-x86_64-61e1ec455e021720
+
+      - name: Install exact Camoufox browser 135.0.1-beta.24
+        if: steps.browser-cache.outputs.cache-hit != 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
+          url='https://github.com/daijro/camoufox/releases/download/v135.0.1-beta.24/camoufox-135.0.1-beta.24-lin.x86_64.zip'
+          expected='61e1ec455e021720af38a5cc5ff7566121363cb5b82b72f24e381ba2676a4888'
+          curl -fL --retry 3 -o /tmp/camoufox.zip "$url"
+          echo "$expected  /tmp/camoufox.zip" | sha256sum --check --strict
+          rm -rf "$HOME/.cache/camoufox"
+          mkdir -p "$HOME/.cache/camoufox"
+          unzip -q /tmp/camoufox.zip -d "$HOME/.cache/camoufox"
+          printf '%s\n' '{"version":"135.0.1","release":"beta.24"}' \
+            > "$HOME/.cache/camoufox/version.json"
+          chmod -R u+rwX,go+rX "$HOME/.cache/camoufox"
+
+      - name: Install pinned Python packages and verify matrix
+        shell: bash
+        run: |
+          python -m pip install --disable-pip-version-check \
+            -r 'turnstile-system/token generators/camoufox-pinned/requirements.txt'
+          python --version
+          python -m camoufox version
+          "$HOME/.cache/camoufox/camoufox-bin" --version
+          python -c 'import camoufox, playwright; print("imports=ok")'
+
+      - name: Run headless generator
+        id: generator
+        continue-on-error: true
+        shell: bash
+        run: |
+          python -u 'turnstile-system/token generators/camoufox-pinned/generator.py'
+
+      - name: Dispatch clean successor for this slot
+        if: always()
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        shell: bash
+        run: |
+          set -u
+          for attempt in 1 2 3 4 5; do
+            if gh workflow run gartic-camoufox-pinned.yml \
+              --ref "$GITHUB_REF_NAME" \
+              -f slot='${{ inputs.slot }}' \
+              -f runtime_minutes='${{ inputs.runtime_minutes }}'; then
+              echo "successor dispatched on attempt=$attempt slot=${{ inputs.slot }}"
+              exit 0
+            fi
+            sleep $((attempt * 5))
+          done
+          echo "successor dispatch failed; workflow_master.py will refill the slot" >&2
+          exit 1
