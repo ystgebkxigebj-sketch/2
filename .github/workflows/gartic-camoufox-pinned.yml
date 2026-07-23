@@ -5,7 +5,7 @@ on:
   workflow_dispatch:
     inputs:
       slot:
-        description: Stable producer slot number (0-19 on GitHub Free)
+        description: Stable producer slot number (0 .. BUDGET_SLOTS-1)
         required: true
         default: "0"
       runtime_minutes:
@@ -28,8 +28,29 @@ jobs:
     env:
       PYTHONUNBUFFERED: "1"
       REQUIRE_PROXY: "1"
+      # One tab, N lanes — never the reverse. Each tab gets its own browser
+      # context and therefore its own cold HTTP cache; lanes share one.
       NUM_TABS: "1"
       NUM_LANES: "1"
+
+      # --- proxy bandwidth budget -------------------------------------------
+      # Every accepted Turnstile token costs ~0.75 MB through the proxy, and the
+      # Webshare account behind CAMOUFOX_PROXIES is capped at 250 GB/month. An
+      # unthrottled producer mints ~2.35 tok/s = ~4,750 GB/month, which is how
+      # the previous account burned its whole quota in 22 hours.
+      #
+      # BUDGET_GB_PER_30D is the slice of that 250 GB cap the WHOLE producer
+      # fleet may spend; the generator derives its mint rate from it. The
+      # account also carries the live bot farm, so this must stay a minority
+      # share. Quick conversions: 1 tok/min = 31.6 GB/month, 1 GB/month = 45.5
+      # tokens/day. 60 GB => ~1.9 tok/min => ~2,730 tokens/day fleet-wide.
+      #
+      # BUDGET_SLOTS is how many producers divide that budget. The supervisor
+      # reads this exact value out of this file to size the fleet, so the two
+      # cannot drift apart — change it here and nowhere else.
+      BUDGET_GB_PER_30D: "60"
+      BUDGET_SLOTS: "2"
+
       MAX_RUNTIME_MINUTES: ${{ inputs.runtime_minutes }}
       AUTH_SECRET: ${{ secrets.CAMOUFOX_AUTH_SECRET }}
       CAMOUFOX_PROXIES: ${{ secrets.CAMOUFOX_PROXIES }}
@@ -52,7 +73,12 @@ jobs:
           selected="${proxies[$index]}"
           echo "::add-mask::$selected"
           echo "PROXY=$selected" >> "$GITHUB_ENV"
-          echo "proxy_count=${#proxies[@]} selected_index=$index"
+          # Webshare meters bandwidth per ACCOUNT, and every proxy in one
+          # account shares a credential, so the number of distinct users in the
+          # secret is the number of 250 GB quotas this fleet is spending. Only
+          # the count is printed — never the credential itself.
+          accounts=$(printf '%s\n' "${proxies[@]}" | cut -d: -f3 | sort -u | wc -l)
+          echo "proxy_count=${#proxies[@]} selected_index=$index accounts=$accounts"
 
       - name: Install Python 3.9.25
         uses: actions/setup-python@v5

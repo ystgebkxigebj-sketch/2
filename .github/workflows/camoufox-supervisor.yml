@@ -24,13 +24,32 @@ jobs:
       - name: Check out repository
         uses: actions/checkout@v4
 
+      - name: Read the fleet size from the producer's bandwidth budget
+        id: fleet
+        shell: bash
+        run: |
+          set -euo pipefail
+          # The producer divides BUDGET_GB_PER_30D across BUDGET_SLOTS producers.
+          # Deriving --target from that same value (rather than repeating the
+          # number here) makes it impossible for the fleet to be larger than the
+          # budget assumes — which would multiply proxy spend by the mismatch and
+          # blow the account's 250 GB cap, exactly what happened on 2026-07-23.
+          slots=$(grep -oP '^\s*BUDGET_SLOTS:\s*"?\K[0-9]+' \
+            .github/workflows/gartic-camoufox-pinned.yml | head -1)
+          if [[ -z "${slots:-}" ]] || (( slots < 1 || slots > 20 )); then
+            echo "could not read a sane BUDGET_SLOTS from the producer workflow" >&2
+            exit 1
+          fi
+          echo "slots=$slots" >> "$GITHUB_OUTPUT"
+          echo "fleet target=$slots"
+
       - name: Refill missing producer slots
         shell: bash
         run: |
           python3 'turnstile-system/token generators/camoufox-pinned/workflow_master.py' \
             --repo "$GITHUB_REPOSITORY" \
             --workflow gartic-camoufox-pinned.yml \
-            --target 20 \
+            --target '${{ steps.fleet.outputs.slots }}' \
             --runtime-minutes 330 \
             --poll-seconds 60 \
             --retire-stale \
