@@ -1,78 +1,48 @@
 # Pinned Camoufox 135 token generator
 
-This package preserves the smallest configuration proven on 2026-07-22:
-Camoufox/Firefox `135.0.1-beta.24`, headless, one browser, one tab, one
-Turnstile lane, `disable_coop=True`, `humanize=False`, and four Firefox content
-processes. The GitHub workflow additionally requires a proxy because hosted
-runner datacenter IPs have previously returned Cloudflare error `600010`.
+Headless Camoufox/Firefox `135.0.1-beta.24` producing Cloudflare Turnstile tokens
+on GitHub-hosted runners and posting them to the relay.
+
+**Full documentation lives in
+[`turnstile-system/token generators/camoufox-pinned/README.md`](turnstile-system/token%20generators/camoufox-pinned/README.md).**
+This file is deliberately a pointer — it used to be a byte-for-byte copy of that
+README and the two drifted.
+
+## Read this before changing the fleet size
+
+An accepted token costs **~0.75 MB** of proxy bandwidth and a Webshare account is
+capped at **250 GB/month**, so one unthrottled producer is ~4,750 GB/month — an
+account per 38 hours. On 2026-07-23 an unthrottled 20-slot fleet did exactly
+that.
+
+The fleet is therefore sized by **bandwidth**, not by how many jobs GitHub will
+run. One knob, in `.github/workflows/gartic-camoufox-pinned.yml`:
+
+```yaml
+BUDGET_GB_PER_30D: "60"   # what the whole fleet may spend in 30 days
+BUDGET_SLOTS: "2"         # producers sharing it; the supervisor reads this
+```
+
+The generator derives its mint rate from those two, and the supervisor derives
+`--target` from `BUDGET_SLOTS`, so the number of producers can never exceed what
+the budget assumed.
 
 ## Repository files
 
-- `.github/workflows/gartic-camoufox-pinned.yml`
-- `.github/workflows/camoufox-supervisor.yml`
+- `.github/workflows/gartic-camoufox-pinned.yml` — the producer
+- `.github/workflows/camoufox-supervisor.yml` — five-minute slot reconciler
 - `turnstile-system/token generators/camoufox-pinned/generator.py`
-- `turnstile-system/token generators/camoufox-pinned/requirements.txt`
 - `turnstile-system/token generators/camoufox-pinned/workflow_master.py`
+- `turnstile-system/token generators/camoufox-pinned/requirements.txt`
+- `turnstile-system/token generators/camoufox-pinned/test_*.py`
 
-## Configure GitHub
+## Actions secrets
 
-Create these repository Actions secrets:
+1. `CAMOUFOX_AUTH_SECRET` — relay `X-Auth` value.
+2. `CAMOUFOX_PROXIES` — newline-separated `HOST:PORT:USER:PASS`. All proxies in
+   one Webshare account share a credential, so the number of distinct `USER`
+   fields is the number of 250 GB quotas this fleet spends. The workflow logs
+   that as `accounts=N`; it should be 1.
 
-1. `CAMOUFOX_AUTH_SECRET`: relay `X-Auth` value.
-2. `CAMOUFOX_PROXIES`: newline-separated `HOST:PORT:USER:PASS` proxies. Use
-   health-checked residential/ISP exits. Do not commit this list.
-
-Optionally create the Actions variable `CAMOUFOX_RELAY_URL`. If omitted, the
-generator uses `https://mohanadino.duckdns.org:8443/add`.
-
-The workflow selects and masks one proxy per slot/run, installs Python 3.9.25,
-pins Camoufox 0.4.11 and Playwright 1.59.0, verifies the official Linux browser
-asset against SHA-256
-`61e1ec455e021720af38a5cc5ff7566121363cb5b82b72f24e381ba2676a4888`, and
-runs headlessly for 330 minutes. It then dispatches the same numbered slot's
-successor. A per-slot concurrency group prevents duplicates.
-
-The supervisor workflow runs every five minutes and executes the same tested
-master planner inside GitHub with `github.token`. It refills only missing slots,
-counts queued jobs toward the 20-run ceiling, and needs no always-on PC or
-personal access token. The per-slot self-chain remains the fast handoff path;
-the supervisor is its recovery layer.
-
-## Bootstrap and supervise manually
-
-Create a fine-grained GitHub token that can read and write Actions for the
-repository, then expose it only in the master process environment:
-
-```powershell
-$env:GH_TOKEN = Read-Host -MaskInput "GitHub token"
-python "turnstile-system/token generators/camoufox-pinned/workflow_master.py" `
-  --repo OWNER/REPO --target 20
-```
-
-Start cautiously with one slot and inspect its log and relay counter:
-
-```powershell
-python "turnstile-system/token generators/camoufox-pinned/workflow_master.py" `
-  --repo OWNER/REPO --target 1 --once
-```
-
-Then run a dry reconciliation before continuous mode:
-
-```powershell
-python "turnstile-system/token generators/camoufox-pinned/workflow_master.py" `
-  --repo OWNER/REPO --target 20 --once --dry-run
-```
-
-Continuous mode polls every 60 seconds. It recognizes active runs by their
-`Camoufox slot N` run title and dispatches only absent slots. It counts any
-unnamed active run against the target, so it cannot knowingly exceed 20. Keep
-the master in `tmux`, a Windows Scheduled Task, or a supervised service only if
-you want faster-than-five-minute external reconciliation.
-
-To stop generation, disable `Camoufox Fleet Supervisor` first, then cancel the
-producer runs. Otherwise the next scheduled supervisor pass intentionally
-restores missing slots. A local continuous master stops with Ctrl+C.
-
-GitHub Free currently permits 20 concurrent standard hosted jobs, but private
-repositories also have a monthly Actions-minute allowance. Check the account's
-plan and usage before bootstrapping 20 long-lived slots.
+Optional Actions variable `CAMOUFOX_RELAY_URL` (defaults to
+`https://mohanadino.duckdns.org:8443/add`).
