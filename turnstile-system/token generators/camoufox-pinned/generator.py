@@ -94,6 +94,10 @@ class Generator:
           try {
             var widgetId = window.turnstile.render('#kutu_' + idx, {
               sitekey: '__SITEKEY__',
+              // gartic validates the token's action server-side (siteverify).
+              // Its own client renders with action:'join'; tokens minted without
+              // it are rejected at join time with event-6 code 5.
+              action: 'join',
               callback: function (token) {
                 console.log('T:' + token);
                 window.turnstile.reset(widgetId);
