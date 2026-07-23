@@ -34,6 +34,6 @@ jobs:
             --runtime-minutes 330 \
             --poll-seconds 60 \
             --retire-stale \
-            --retire-max 4 \
+            --retire-max-running 1 \
             --once \
             --lock-file /tmp/camoufox-supervisor.lock

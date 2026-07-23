@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import calendar
 import json
 import os
 import re
@@ -17,6 +18,15 @@ from pathlib import Path
 
 ACTIVE_STATUSES = {"queued", "in_progress", "waiting", "pending", "requested"}
 SLOT_RE = re.compile(r"^Camoufox slot (\d+)$")
+SHA_RE = re.compile(r"^[0-9a-f]{40}$")
+
+# Paths whose commits actually change what a producer executes. Staleness is
+# keyed on these rather than on the raw branch head so that unrelated commits
+# (README, docs, other workflows) do not churn the whole fleet.
+PRODUCER_PATHS = (
+    "turnstile-system/token generators/camoufox-pinned",
+    ".github/workflows/gartic-camoufox-pinned.yml",
+)
 
 
 @dataclass(frozen=True)
@@ -32,36 +42,80 @@ class RetirePlan:
     stale_total: int
 
 
-def plan_retire(runs: list[dict], head_sha: str, max_cancel: int) -> RetirePlan:
-    """Pick active runs that are executing outdated code.
+def _age_seconds(created_at: str | None, now_epoch: float) -> float:
+    """Seconds since a run was created; 0.0 when the timestamp is unusable."""
+    if not created_at:
+        return 0.0
+    try:
+        stamp = time.strptime(created_at, "%Y-%m-%dT%H:%M:%SZ")
+    except (TypeError, ValueError):
+        return 0.0
+    return now_epoch - calendar.timegm(stamp)
 
-    A run's `head_sha` is fixed when it is dispatched, and `actions/checkout`
-    checks out exactly that commit — so any active run whose head_sha differs
-    from the branch head is still running old generator code and must be
-    retired. (This is how the 2026-07-23 `action:'join'` fix was rolled out:
-    producers minting actionless tokens had to be cycled, not waited out for
-    their full 330-minute runtime.)
 
-    Only `max_cancel` runs are returned per cycle so token supply degrades
-    gracefully instead of dropping to zero — a replacement needs several
-    minutes to install Camoufox before it produces anything.
+def plan_retire(
+    runs: list[dict],
+    stale_shas: frozenset[str],
+    *,
+    max_in_progress: int,
+    max_queued: int,
+    min_age_seconds: float,
+    now_epoch: float,
+) -> RetirePlan:
+    """Pick active producer runs that are executing outdated code.
 
-    Cancelling is self-healing: the producer workflow's successor-dispatch step
-    is `if: always()`, which GitHub still runs on cancellation, so each retired
-    run dispatches its own replacement on the current default branch.
+    A run's `head_sha` is pinned when it is dispatched and `actions/checkout`
+    checks out exactly that commit, so head_sha is an exact "is this running old
+    code?" test. `stale_shas` is resolved by the caller (see
+    `GitHubAPI.stale_shas`) rather than compared to the branch head directly, so
+    an unrelated docs commit does not mark the whole fleet stale.
+
+    Caps are split by status because cancelling costs something very different
+    in each case, and because `if: always()` behaves asymmetrically:
+
+      * `queued`/`pending`/`waiting` — no runner assigned, so the job's steps
+        (including its successor-dispatch) never execute. Cancelling costs zero
+        supply, but `plan_refill` must provide the replacement. These still MUST
+        be retired: their head_sha is already pinned to the old commit, so they
+        would check out stale code whenever they eventually start.
+      * `in_progress` — cancelling removes live production, but the workflow's
+        successor step is `if: always()`, which GitHub still runs on
+        cancellation, so the dying run dispatches its own replacement against
+        the branch head (i.e. the fixed commit). Capped tightly: with only a
+        handful of concurrent jobs, cancelling several at once would drop token
+        supply to zero for the minutes a replacement needs to install Camoufox.
+
+    Safety rules: nothing is cancelled unless it is one of ours (`display_title`
+    matches `SLOT_RE`) and was dispatched by us; runs younger than
+    `min_age_seconds` are skipped as a circuit breaker against a
+    cancel/dispatch/cancel loop if the staleness check ever misfires.
     """
-    if not head_sha:
+    if not stale_shas:
         return RetirePlan((), 0)
-    stale = [
-        run for run in runs
-        if run.get("status") in ACTIVE_STATUSES
-        and run.get("head_sha")
-        and run.get("head_sha") != head_sha
-    ]
-    # Retire longest-running first: they have the most remaining runtime to waste.
-    stale.sort(key=lambda run: run.get("created_at") or "")
-    ids = tuple(int(run["id"]) for run in stale[:max(0, max_cancel)])
-    return RetirePlan(ids, len(stale))
+
+    eligible: list[dict] = []
+    for run in runs:
+        if run.get("status") not in ACTIVE_STATUSES:
+            continue
+        if run.get("head_sha") not in stale_shas:
+            continue
+        # Only ever touch our own slot runs — never a human-triggered or legacy run.
+        if not SLOT_RE.match(run.get("display_title") or ""):
+            continue
+        if run.get("event") != "workflow_dispatch":
+            continue
+        if _age_seconds(run.get("created_at"), now_epoch) < min_age_seconds:
+            continue
+        eligible.append(run)
+
+    def oldest_first(bucket: list[dict]) -> list[dict]:
+        return sorted(bucket, key=lambda run: run.get("created_at") or "")
+
+    running = oldest_first([r for r in eligible if r.get("status") == "in_progress"])
+    pending = oldest_first([r for r in eligible if r.get("status") != "in_progress"])
+
+    picked = pending[:max(0, max_queued)] + running[:max(0, max_in_progress)]
+    return RetirePlan(tuple(int(run["id"]) for run in picked), len(eligible))
 
 
 def plan_refill(runs: list[dict], target: int) -> RefillPlan:
@@ -83,7 +137,7 @@ class GitHubAPI:
     def __init__(self, token: str) -> None:
         self.token = token
 
-    def request(self, method: str, path: str, body: dict | None = None) -> dict:
+    def request(self, method: str, path: str, body: dict | None = None) -> dict | list:
         data = json.dumps(body).encode("utf-8") if body is not None else None
         request = urllib.request.Request(
             f"https://api.github.com/{path}",
@@ -113,19 +167,71 @@ class GitHubAPI:
         data = self.request("GET", path)
         return data.get("workflow_runs", [])
 
-    def branch_head_sha(self, repo: str, branch: str) -> str:
-        path = f"repos/{repo}/commits/{urllib.parse.quote(branch, safe='')}"
-        return self.request("GET", path).get("sha", "")
+    def latest_producer_commit(self, repo: str, branch: str) -> str:
+        """Newest commit touching producer code (generator dir or its workflow)."""
+        best_sha, best_date = "", ""
+        for path in PRODUCER_PATHS:
+            query = urllib.parse.urlencode({"sha": branch, "path": path, "per_page": 1})
+            data = self.request("GET", f"repos/{repo}/commits?{query}")
+            if isinstance(data, list) and data:
+                commit = data[0]
+                date = ((commit.get("commit") or {}).get("committer") or {}).get("date", "")
+                if date > best_date:
+                    best_date, best_sha = date, commit.get("sha", "")
+        return best_sha
 
-    def cancel(self, repo: str, run_id: int) -> bool:
-        """Cancel a run. Returns False if it already finished (HTTP 409)."""
+    def compare_status(self, repo: str, base: str, head: str) -> str:
+        base_q = urllib.parse.quote(base, safe="")
+        head_q = urllib.parse.quote(head, safe="")
+        data = self.request("GET", f"repos/{repo}/compare/{base_q}...{head_q}")
+        return data.get("status", "") if isinstance(data, dict) else ""
+
+    def stale_shas(self, repo: str, branch: str, runs: list[dict]) -> frozenset[str]:
+        """Which active runs' commits predate the newest producer-code commit.
+
+        `compare/{run_sha}...{code_sha}` reports `code_sha` relative to the run:
+          ahead     -> code_sha descends from the run's commit => run is STALE
+          identical -> run is exactly at the code commit       => fresh
+          behind    -> run already contains the code commit    => fresh
+          diverged  -> force-push/rebase; unknown              => never cancel
+        Any lookup failure yields no stale shas, so the caller cancels nothing.
+        """
+        code_sha = self.latest_producer_commit(repo, branch)
+        if not SHA_RE.match(code_sha or ""):
+            return frozenset()
+        candidates = {
+            run.get("head_sha") for run in runs
+            if run.get("status") in ACTIVE_STATUSES
+        }
+        stale: set[str] = set()
+        for sha in candidates:
+            if not sha or not SHA_RE.match(sha) or sha == code_sha:
+                continue
+            try:
+                if self.compare_status(repo, sha, code_sha) == "ahead":
+                    stale.add(sha)
+            except RuntimeError as error:
+                print(f"compare {sha[:7]} failed, treating as fresh: {error}",
+                      file=sys.stderr, flush=True)
+        return frozenset(stale)
+
+    def cancel(self, repo: str, run_id: int) -> str:
+        """Cancel a run. Benign terminal states are reported, never raised.
+
+        A single already-finished run must not abort the whole supervisor cycle
+        (which would also skip the refill dispatches), so 409/404 are outcomes
+        rather than errors.
+        """
         try:
             self.request("POST", f"repos/{repo}/actions/runs/{run_id}/cancel")
         except RuntimeError as error:
-            if "HTTP 409" in str(error):
-                return False
-            raise
-        return True
+            message = str(error)
+            if "HTTP 409" in message:
+                return "already-final"
+            if "HTTP 404" in message:
+                return "gone"
+            return f"failed: {message[:120]}"
+        return "cancel-requested"
 
     def dispatch(
         self, repo: str, workflow: str, branch: str, slot: int, runtime: int
@@ -162,13 +268,25 @@ def main() -> int:
     parser.add_argument(
         "--retire-stale",
         action="store_true",
-        help="cancel active runs whose head_sha != branch head (they run outdated code)",
+        help="cancel active runs whose commit predates the newest producer-code commit",
     )
     parser.add_argument(
-        "--retire-max",
+        "--retire-max-running",
         type=int,
-        default=4,
-        help="max stale runs to cancel per cycle, so supply degrades gradually",
+        default=1,
+        help="max in_progress runs to cancel per cycle (each is live token supply)",
+    )
+    parser.add_argument(
+        "--retire-max-queued",
+        type=int,
+        default=20,
+        help="max queued/pending runs to cancel per cycle (these produce nothing)",
+    )
+    parser.add_argument(
+        "--retire-min-age-seconds",
+        type=int,
+        default=600,
+        help="never cancel a run younger than this (circuit breaker)",
     )
     parser.add_argument("--once", action="store_true")
     parser.add_argument("--dry-run", action="store_true")
@@ -197,28 +315,10 @@ def main() -> int:
         while True:
             try:
                 runs = api.list_runs(repo, args.workflow)
-                if args.retire_stale:
-                    head_sha = api.branch_head_sha(repo, branch)
-                    retire = plan_retire(runs, head_sha, args.retire_max)
-                    print(
-                        f"head_sha={head_sha[:7] or '?'} stale_active={retire.stale_total} "
-                        f"retiring={len(retire.stale)}",
-                        flush=True,
-                    )
-                    for run_id in retire.stale:
-                        if args.dry_run:
-                            print(f"dry-run cancel run={run_id}", flush=True)
-                            continue
-                        if api.cancel(repo, run_id):
-                            print(f"cancelled stale run={run_id}", flush=True)
-                        else:
-                            print(f"stale run={run_id} already finished", flush=True)
-                        time.sleep(1)
-                    if retire.stale:
-                        # Cancelled runs stay 'active' briefly, which would starve
-                        # plan_refill's capacity math. Their own always() successor
-                        # step re-dispatches them, so refill can wait a cycle.
-                        runs = api.list_runs(repo, args.workflow)
+
+                # Refill from the pre-cancel snapshot FIRST, so a slot is never
+                # dispatched in the same cycle it is cancelled — that would race
+                # the dying run's own always() successor dispatch.
                 plan = plan_refill(runs, args.target)
                 print(
                     f"active_slots={len(plan.active_slots)} unnamed_active={plan.unnamed_active} "
@@ -232,6 +332,28 @@ def main() -> int:
                         api.dispatch(repo, args.workflow, branch, slot, args.runtime_minutes)
                         print(f"dispatched slot={slot}", flush=True)
                         time.sleep(2)
+
+                if args.retire_stale:
+                    stale = api.stale_shas(repo, branch, runs)
+                    retire = plan_retire(
+                        runs,
+                        stale,
+                        max_in_progress=args.retire_max_running,
+                        max_queued=args.retire_max_queued,
+                        min_age_seconds=args.retire_min_age_seconds,
+                        now_epoch=time.time(),
+                    )
+                    print(
+                        f"stale_commits={len(stale)} eligible={retire.stale_total} "
+                        f"retiring={len(retire.stale)}",
+                        flush=True,
+                    )
+                    for run_id in retire.stale:
+                        if args.dry_run:
+                            print(f"dry-run cancel run={run_id}", flush=True)
+                            continue
+                        print(f"cancel run={run_id}: {api.cancel(repo, run_id)}", flush=True)
+                        time.sleep(1)
             except Exception as error:
                 print(f"master cycle failed: {error}", file=sys.stderr, flush=True)
                 if args.once:
