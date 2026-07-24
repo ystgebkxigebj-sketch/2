@@ -50,8 +50,10 @@ on:
 permissions:
   contents: read
 
+# Keyed by arm so an OS sweep is not stuck behind a tunnel sweep. Still one run
+# per arm; do not dispatch more than a couple of arms at a time.
 concurrency:
-  group: exp-egress
+  group: exp-egress-${{ inputs.tunnel }}
   cancel-in-progress: false
 
 jobs:
@@ -66,7 +68,7 @@ jobs:
         run: |
           set -euo pipefail
           case '${{ inputs.runners }}' in
-            all)       m='["ubuntu-24.04","macos-13","macos-latest","windows-latest"]' ;;
+            all)       m='["ubuntu-24.04","ubuntu-24.04-arm","macos-13","macos-latest","windows-latest"]' ;;
             non-linux) m='["macos-13","macos-latest","windows-latest"]' ;;
             *)         m='["${{ inputs.runners }}"]' ;;
           esac
