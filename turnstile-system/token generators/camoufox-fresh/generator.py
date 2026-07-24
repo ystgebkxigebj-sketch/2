@@ -138,6 +138,25 @@ async def run_session(args, stats: Stats, out_handle, deadline: float | None) ->
         launch["executable_path"] = str(Path(args.executable))
         launch["ff_version"] = args.ff_version
         launch["i_know_what_im_doing"] = True
+    # PROXY is HOST:PORT[:USER:PASS] — an HTTP CONNECT proxy, which keeps the
+    # page origin on gartic.io (a URL-rewriting proxy would not; see README).
+    # geoip defaults ON whenever a proxy is used: Camoufox otherwise reports a
+    # timezone/locale that contradicts the proxy's exit IP, and Cloudflare
+    # refuses the challenge with 600010.
+    proxy_raw = os.environ.get("PROXY", "").strip()
+    if proxy_raw:
+        parts = proxy_raw.split(":", 3)
+        if len(parts) == 2:
+            launch["proxy"] = {"server": f"http://{parts[0]}:{parts[1]}"}
+        elif len(parts) == 4:
+            launch["proxy"] = {
+                "server": f"http://{parts[0]}:{parts[1]}",
+                "username": parts[2],
+                "password": parts[3],
+            }
+        else:
+            raise SystemExit("PROXY must be HOST:PORT or HOST:PORT:USER:PASS")
+        launch["geoip"] = True
     if args.geoip:
         launch["geoip"] = True
 
@@ -287,7 +306,8 @@ async def main() -> int:
     print(
         f"[config] label={args.label} humanize={args.humanize} "
         f"lifetime={args.browser_lifetime}s reload={args.reload_interval}s "
-        f"interval={args.token_interval}s ff={args.ff_version}",
+        f"interval={args.token_interval}s ff={args.ff_version} "
+        f"proxy={'yes' if os.environ.get('PROXY', '').strip() else 'direct'}",
         flush=True,
     )
 

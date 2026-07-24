@@ -54,5 +54,12 @@ jobs:
             --poll-seconds 60 \
             --retire-stale \
             --retire-max-running 1 \
+            --max-dispatch-per-cycle 1 \
             --once \
             --lock-file /tmp/camoufox-supervisor.lock
+
+          # One slot per 5-minute cycle. Every producer holds a Webshare proxy
+          # for its whole life and each token costs ~0.75 MB of metered
+          # bandwidth, so a cold start of N slots at once would commit the full
+          # monthly spend before the first producer is even seen to be healthy.
+          # Ramping means a bad config costs one slot, not the whole quota.

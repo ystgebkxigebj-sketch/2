@@ -118,7 +118,15 @@ def plan_retire(
     return RetirePlan(tuple(int(run["id"]) for run in picked), len(eligible))
 
 
-def plan_refill(runs: list[dict], target: int) -> RefillPlan:
+def plan_refill(runs: list[dict], target: int, max_dispatch: int = 0) -> RefillPlan:
+    """Pick which slots to start.
+
+    `max_dispatch` caps how many are started in ONE cycle. Ramping the fleet one
+    slot at a time matters because every producer holds a proxy open for its
+    whole life and burns metered Webshare bandwidth (~0.75 MB per token): a cold
+    start of 20 at once commits the full spend before anyone can see whether the
+    first one is even healthy. 0 means unlimited (the historical behaviour).
+    """
     active = [run for run in runs if run.get("status") in ACTIVE_STATUSES]
     slots: set[int] = set()
     unnamed = 0
@@ -130,6 +138,8 @@ def plan_refill(runs: list[dict], target: int) -> RefillPlan:
             unnamed += 1
     capacity = max(0, target - len(active))
     missing = [slot for slot in range(target) if slot not in slots][:capacity]
+    if max_dispatch > 0:
+        missing = missing[:max_dispatch]
     return RefillPlan(frozenset(slots), tuple(missing), unnamed)
 
 
@@ -288,6 +298,14 @@ def main() -> int:
         default=600,
         help="never cancel a run younger than this (circuit breaker)",
     )
+    parser.add_argument(
+        "--max-dispatch-per-cycle",
+        type=int,
+        default=1,
+        help="start at most this many slots per cycle (0 = unlimited). Default 1 "
+             "so the fleet ramps one slot at a time instead of committing the "
+             "whole metered proxy budget on a cold start",
+    )
     parser.add_argument("--once", action="store_true")
     parser.add_argument("--dry-run", action="store_true")
     parser.add_argument("--lock-file", type=Path, default=Path(".camoufox-master.lock"))
@@ -319,10 +337,11 @@ def main() -> int:
                 # Refill from the pre-cancel snapshot FIRST, so a slot is never
                 # dispatched in the same cycle it is cancelled — that would race
                 # the dying run's own always() successor dispatch.
-                plan = plan_refill(runs, args.target)
+                plan = plan_refill(runs, args.target, args.max_dispatch_per_cycle)
                 print(
                     f"active_slots={len(plan.active_slots)} unnamed_active={plan.unnamed_active} "
-                    f"missing={list(plan.missing_slots)}",
+                    f"dispatching={list(plan.missing_slots)} "
+                    f"(cap {args.max_dispatch_per_cycle or 'unlimited'}/cycle)",
                     flush=True,
                 )
                 for slot in plan.missing_slots:
