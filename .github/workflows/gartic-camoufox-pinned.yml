@@ -162,9 +162,20 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           GH_REPO: ${{ github.repository }}
+          GENERATOR_OUTCOME: ${{ steps.generator.outcome }}
         shell: bash
         run: |
           set -u
+          # A run that relayed no token almost always fails again immediately for
+          # the same reason (blocked IP, dead proxy), and the successor starts at
+          # once — so the chain becomes a hot loop. A proxyless experiment on
+          # 2026-07-24 burned ~15 runs in an hour that way, each dying on
+          # Cloudflare 600010 after ~4 minutes. Back off so a broken config fails
+          # slowly and visibly instead of hammering.
+          if [[ "$GENERATOR_OUTCOME" != "success" ]]; then
+            echo "generator relayed no token; backing off 300s before handoff"
+            sleep 300
+          fi
           for attempt in 1 2 3 4 5; do
             if gh workflow run gartic-camoufox-pinned.yml \
               --ref "$GITHUB_REF_NAME" \

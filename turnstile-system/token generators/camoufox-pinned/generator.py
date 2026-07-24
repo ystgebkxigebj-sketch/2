@@ -536,8 +536,12 @@ class Generator:
                     # slow producer by the stall clock, so failing the run is what
                     # rotates us onto a different proxy: the successor dispatch
                     # picks a new index from GITHUB_RUN_NUMBER.
+                    where = "proxy likely dead" if self.proxy else (
+                        "solving direct — this runner's IP is probably blocked "
+                        "by Cloudflare (600010)"
+                    )
                     raise RuntimeError(
-                        f"{self.errors_since_token} consecutive Turnstile errors; proxy likely dead"
+                        f"{self.errors_since_token} consecutive Turnstile errors; {where}"
                     )
                 if self.stats.callbacks == callbacks_at_start:
                     # The first solve of a cycle is never budget-gated, so this

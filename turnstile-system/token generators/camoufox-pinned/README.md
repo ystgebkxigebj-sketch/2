@@ -74,10 +74,28 @@ Leave the rest alone unless you have a measurement:
   everything except the page document and `challenges.cloudflare.com`, and the
   document is fetched once per browser cycle. ~0.75 MB is close to the raw cost
   of one solve on this sitekey.
-- **Solving without a proxy.** Runner datacenter IPs get Cloudflare error
-  `600010`, and tokens solved from a datacenter IP are rejected by gartic at join
-  time (measured 0/88 from the Oracle VM). A residential-class exit is required
-  for the solve to be *accepted*, not just to succeed.
+- **Solving without a proxy on a GitHub runner.** Settled experimentally on
+  2026-07-24 with `use_proxy=false` on pinned v135: **13× `CF:err:lane0:600010`,
+  zero tokens.** Cloudflare will not serve the challenge to GitHub's hosted IP
+  ranges, and the version pin does not change that. Note the two effects are
+  independent and were previously conflated — Camoufox 152 produced 600010 even
+  on a *residential* line (which is what the v152-vs-v135 A/B measured), while
+  GitHub's IPs produce it even on v135. **The proxy is mandatory here.**
+
+  What is *not* true: that a datacenter IP taints the token. The Oracle VM solves
+  proxy-free from a datacenter IP and those tokens join at 100% (verified
+  2026-07-24, replayed through `cmd/joindebug` both direct and via a Webshare
+  exit). The old "0/88, only residential-proxy-solved tokens work" note was
+  measuring the `platform:2` join bug, not the solve IP. So the proxy is needed
+  for Cloudflare to *serve the challenge to this runner*, not for gartic to
+  *accept the result*.
+
+- **CroxyProxy as a solving proxy.** It is a URL-rewriting web proxy
+  (`?__cpo=<base64 target>`, `__cpw.php` for WebSocket), not an HTTP CONNECT
+  proxy, so the browser cannot be pointed at it — and loading gartic.io through
+  it makes the page origin the croxy host, which fails Turnstile's sitekey domain
+  check before any IP question arises. It remains useful for *bot joins*
+  (icebot's `relay` tier), just not for minting.
 - **The AFK public-room fill, on metered proxies, ever.** At ~3.3 tok/s it is
   ~6,270 GB/month — twenty-five Webshare accounts.
 
