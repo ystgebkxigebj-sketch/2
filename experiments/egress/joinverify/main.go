@@ -39,42 +39,51 @@ import (
 	"golang.org/x/net/proxy"
 )
 
-// dialerFor returns a net dial function honouring an optional socks5:// or
-// http:// proxy URL. An empty spec means dial directly.
-func dialerFor(spec string) (func(ctx context.Context, network, addr string) (net.Conn, error), error) {
+type dialFunc func(ctx context.Context, network, addr string) (net.Conn, error)
+
+// transportFor resolves an optional proxy spec into the two knobs both the HTTP
+// client and the websocket dialer need. The split matters: a SOCKS proxy is a
+// custom dialer, whereas an HTTP proxy must go through the standard Proxy hook
+// so that a CONNECT is issued. Using a raw dialer for an http:// proxy would
+// silently talk TLS to the proxy itself.
+func transportFor(spec string) (dialFunc, func(*http.Request) (*url.URL, error), error) {
+	base := &net.Dialer{Timeout: 15 * time.Second}
 	if spec == "" {
-		base := &net.Dialer{Timeout: 15 * time.Second}
-		return base.DialContext, nil
+		return base.DialContext, nil, nil
 	}
 	parsed, err := url.Parse(spec)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
-	var auth *proxy.Auth
-	if parsed.User != nil {
-		password, _ := parsed.User.Password()
-		auth = &proxy.Auth{User: parsed.User.Username(), Password: password}
+	if strings.HasPrefix(parsed.Scheme, "socks") {
+		var auth *proxy.Auth
+		if parsed.User != nil {
+			password, _ := parsed.User.Password()
+			auth = &proxy.Auth{User: parsed.User.Username(), Password: password}
+		}
+		socks, err := proxy.SOCKS5("tcp", parsed.Host, auth, base)
+		if err != nil {
+			return nil, nil, err
+		}
+		return func(ctx context.Context, network, addr string) (net.Conn, error) {
+			return socks.Dial(network, addr)
+		}, nil, nil
 	}
-	socks, err := proxy.SOCKS5("tcp", parsed.Host, auth, &net.Dialer{Timeout: 15 * time.Second})
-	if err != nil {
-		return nil, err
-	}
-	return func(ctx context.Context, network, addr string) (net.Conn, error) {
-		return socks.Dial(network, addr)
-	}, nil
+	return base.DialContext, http.ProxyURL(parsed), nil
 }
 
 const userAgent = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 " +
 	"(KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
 
 func run(token, proxySpec string) string {
-	dial, err := dialerFor(proxySpec)
+	dial, proxyHook, err := transportFor(proxySpec)
 	if err != nil {
 		return "ERROR:proxy:" + err.Error()
 	}
 	transport := &http.Transport{
 		TLSClientConfig: &tls.Config{InsecureSkipVerify: true},
 		DialContext:     dial,
+		Proxy:           proxyHook,
 	}
 	client := &http.Client{Timeout: 20 * time.Second, Transport: transport}
 
@@ -127,6 +136,7 @@ func run(token, proxySpec string) string {
 		TLSClientConfig:  &tls.Config{InsecureSkipVerify: true},
 		HandshakeTimeout: 15 * time.Second,
 		NetDialContext:   dial,
+		Proxy:            proxyHook,
 	}
 	socket, dialResponse, err := dialer.Dial(url, header)
 	if err != nil {
