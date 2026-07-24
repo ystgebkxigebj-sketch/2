@@ -60,15 +60,13 @@ on:
         description: Concurrent producers in THIS dispatch (~40 tok/min each on warp, ~19 on vpngate)
         required: true
         default: "2"
-        type: choice
-        # Capped at the account's MEASURED concurrent-job ceiling, which is 9 —
-        # not the 20 the GitHub Free docs quote. Measured 2026-07-24 by queueing
-        # 32 then 24 trivial jobs with no max-parallel and reading the peak
-        # overlap from the jobs API: three clean waves of exactly 9.
-        # 9 saturates the account and starves the supervisor's own tick, so it
-        # is here for deliberate one-off bursts only; the 24/7 fleet target is
-        # CAMOUFOX_FLEET_TARGET and is held below this on purpose.
-        options: ["1", "2", "3", "4", "5", "6", "7", "8", "9"]
+        # A free string, not a choice, so a burst/scale test can ask for any N.
+        # The account's MEASURED long-job concurrency ceiling is ~20 (a probe of
+        # TRIVIAL jobs undercounts it, because 100 s jobs cycle through GitHub's
+        # ~5-6 min runner-grant ramp before they can stack; producer-length jobs
+        # live through the ramp and stack to the real ceiling). For the sustained
+        # 24/7 fleet the supervisor dispatches producers=1 runs and keeps
+        # CAMOUFOX_FLEET_TARGET of them alive; this input is for one-off bursts.
       duration:
         description: Seconds to mint for (job timeout is 350 min, GitHub caps jobs at 6 h)
         required: true
@@ -106,20 +104,41 @@ permissions:
 # and stopped by CAMOUFOX_FLEET_ENABLED; those are the controls, not this.
 
 jobs:
-  # There is deliberately no `plan` job computing this matrix.
-  #
-  # The account's real ceiling is 9 concurrent jobs (measured), and a separate
-  # planner job spends one of them on every single dispatch — which, with the
-  # supervisor dispatching a replacement producer several times a day, is a slot
-  # taken away from minting for no benefit. GitHub expressions have no range
-  # function, so the fan-out is a literal lookup table instead. Ugly, but it is
-  # one job instead of two and it cannot fail at runtime.
+  # A tiny plan job builds the producer index list [1..N] for an arbitrary N.
+  # GitHub expressions have no range(), so the alternative is a fixed lookup
+  # table that would have to be extended by hand every time the ceiling changes.
+  # The plan job runs ~15 s and frees its runner before the producers ramp, so
+  # it does not eat a steady-state slot — the supervisor's own producers=1 runs
+  # spawn a trivially short plan each, which is gone long before the producer it
+  # planned starts minting.
+  plan:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 2
+    outputs:
+      matrix: ${{ steps.pick.outputs.matrix }}
+    steps:
+      - id: pick
+        shell: bash
+        run: |
+          set -euo pipefail
+          n='${{ inputs.producers }}'
+          if ! [[ "$n" =~ ^[0-9]+$ ]] || (( n < 1 || n > 20 )); then
+            echo "producers must be an integer in 1..20, got '$n'" >&2; exit 1
+          fi
+          m=$(python3 -c "import json,sys;print(json.dumps(list(range(1,int(sys.argv[1])+1))))" "$n")
+          echo "matrix=$m" >> "$GITHUB_OUTPUT"
+          echo "matrix=$m"
+
   produce:
+    needs: plan
     strategy:
       fail-fast: false
-      max-parallel: 9
+      # ~20 is the measured long-job ceiling; the supervisor holds the sustained
+      # fleet below it (CAMOUFOX_FLEET_HARD_CAP) so its own reconcile job and the
+      # plan jobs always find a runner. This ceiling is for one-off burst tests.
+      max-parallel: 20
       matrix:
-        idx: ${{ fromJSON('{"1":[1],"2":[1,2],"3":[1,2,3],"4":[1,2,3,4],"5":[1,2,3,4,5],"6":[1,2,3,4,5,6],"7":[1,2,3,4,5,6,7],"8":[1,2,3,4,5,6,7,8],"9":[1,2,3,4,5,6,7,8,9]}')[inputs.producers] }}
+        idx: ${{ fromJSON(needs.plan.outputs.matrix) }}
     runs-on: ubuntu-24.04
     timeout-minutes: 350
     env:
