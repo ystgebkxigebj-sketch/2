@@ -239,11 +239,10 @@ jobs:
         run: |
           echo "===== ${{ inputs.tunnel }} job ${{ matrix.idx }}/${{ inputs.fanout }} exit=${EXITIP:-unknown} ====="
           if [[ -f "$RUNNER_TEMP/result.json" ]]; then
-            python3 -c "
-import json,os
-r=json.load(open(os.environ['RUNNER_TEMP']+'/result.json'))
-r['exit_ip']=os.environ.get('EXITIP','unknown')
-print('SCALE '+json.dumps(r,sort_keys=True))"
+            # Kept to one line deliberately: inside a YAML block scalar, a line
+            # at lower indentation than the block ends the block, and a line at
+            # higher indentation is fed to python as leading whitespace.
+            python3 -c "import json,os;r=json.load(open(os.environ['RUNNER_TEMP']+'/result.json'));r['exit_ip']=os.environ.get('EXITIP','unknown');print('SCALE '+json.dumps(r,sort_keys=True))"
           else
             echo 'SCALE {"error":"no result file","exit_ip":"'"${EXITIP:-unknown}"'"}'
           fi
