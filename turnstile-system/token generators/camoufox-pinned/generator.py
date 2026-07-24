@@ -378,11 +378,26 @@ class Generator:
             return
         try:
             self.solving = True
-            ok = await page.evaluate("(idx) => window.__tsReset(idx)", lane)
-            if not ok:
+            # gartic.io is a Next.js SPA: it can re-render or navigate after load
+            # and wipe `window`, taking __tsReset with it. Moving reset() out of
+            # the page callback (so Python can pace it) made us depend on that
+            # helper surviving, so re-inject the renderer whenever it is gone —
+            # otherwise the lane dies and every cycle yields exactly one token.
+            ok = await page.evaluate(
+                "(idx) => (typeof window.__tsReset === 'function' ? window.__tsReset(idx) : null)",
+                lane,
+            )
+            if ok is None:
+                print(f"[turnstile] lane={lane} lost its widget; re-injecting", flush=True)
+                await page.add_script_tag(content=self.renderer_js())
+            elif not ok:
                 print(f"[turnstile] reset lane={lane} rejected", flush=True)
         except Exception as error:
             print(f"[turnstile] reset lane={lane} failed: {type(error).__name__}", flush=True)
+            try:
+                await page.add_script_tag(content=self.renderer_js())
+            except Exception:
+                pass
 
     def schedule_mint(self, page, lane: int) -> None:
         task = asyncio.create_task(self.mint_next(page, lane))
