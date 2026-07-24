@@ -1,0 +1,61 @@
+name: EXP concurrency ceiling
+run-name: concurrency probe (${{ inputs.jobs }} jobs)
+
+# EXPERIMENT — dispatch-only, no cron, no successor dispatch, no Webshare.
+#
+# Question: how many standard hosted jobs will this account actually run at
+# once? The documented GitHub Free ceiling is 20 concurrent jobs, but the number
+# that matters for fleet sizing is the one this account really gets, and the
+# supervisor's own job plus the producer's `plan` job consume slots too.
+#
+# Method: dispatch N trivial jobs with NO max-parallel, let them queue, then read
+# every job's started_at/completed_at from the API and compute the maximum
+# overlap. Each job sleeps long enough that the peak is unambiguous but short
+# enough that the whole probe costs ~4 minutes.
+#
+# Nothing here mints, tunnels, or touches the relay.
+
+on:
+  workflow_dispatch:
+    inputs:
+      jobs:
+        description: How many trivial jobs to queue at once
+        required: true
+        default: "32"
+      hold_seconds:
+        description: Seconds each job holds its runner
+        required: true
+        default: "100"
+
+permissions:
+  contents: read
+
+jobs:
+  plan:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 2
+    outputs:
+      matrix: ${{ steps.pick.outputs.matrix }}
+    steps:
+      - id: pick
+        shell: bash
+        run: |
+          set -euo pipefail
+          m=$(python3 -c "print(__import__('json').dumps(list(range(1, ${{ inputs.jobs }}+1))))")
+          echo "matrix=$m" >> "$GITHUB_OUTPUT"
+
+  hold:
+    needs: plan
+    strategy:
+      fail-fast: false
+      # Deliberately NO max-parallel: the queue depth is the measurement.
+      matrix:
+        idx: ${{ fromJSON(needs.plan.outputs.matrix) }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - shell: bash
+        run: |
+          echo "job ${{ matrix.idx }} started $(date -u +%FT%TZ) on $(hostname)"
+          sleep '${{ inputs.hold_seconds }}'
+          echo "job ${{ matrix.idx }} finished $(date -u +%FT%TZ)"
