@@ -1,0 +1,231 @@
+name: Gartic Camoufox WARP
+run-name: Camoufox via WARP (${{ inputs.duration }}s)
+
+# Token producer that costs ZERO metered proxy bandwidth.
+#
+# The fleet used to need a Webshare HTTP CONNECT proxy because Cloudflare
+# refuses to serve the Turnstile challenge to GitHub's own egress. That refusal
+# is an ASN property, not a GitHub property: every GitHub-hosted fleet — Linux,
+# Windows, macOS, x64 and arm64 — egresses from AS8075 (Microsoft), and all of
+# them get a solid wall of Cloudflare error 600010.
+#
+# Measured on 2026-07-24, same workflow, same commit, same minute:
+#
+#   ubuntu-24.04 direct (AS8075 Microsoft)   -> 0 tokens, 93x 600010
+#   ubuntu-24.04 via WARP (AS13335 Cloudflare) -> 238 tokens in 301s
+#                                              = 47.4 tok/min, 0 cf errors,
+#                                                3/3 verified JOINED
+#
+# WARP is free, needs no account and no credentials: wgcf registers anonymously
+# and wireproxy runs WireGuard in userspace, so there is no kernel module and no
+# root involved. At ~0.75 MB/token this run would have cost ~180 MB of Webshare;
+# it costs nothing.
+#
+# Not scheduled on purpose. The relay is currently oversupplied — 83% of tokens
+# minted expire unused — so this is insurance, not something to leave running.
+# Read `oracle server/research/github-no-webshare.md` before enabling a cron.
+
+on:
+  workflow_dispatch:
+    inputs:
+      duration:
+        description: Seconds to mint for (job timeout is 350 min)
+        required: true
+        default: "1800"
+      token_interval:
+        description: Seconds to wait after each token (0 = unthrottled ~47/min)
+        required: true
+        default: "0"
+      post_to_relay:
+        description: Feed the live relay (false = measure only)
+        required: true
+        default: "false"
+        type: choice
+        options: ["false", "true"]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: camoufox-warp
+  cancel-in-progress: false
+
+jobs:
+  produce:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 350
+    env:
+      PYTHONUNBUFFERED: "1"
+      AUTH_SECRET: ${{ secrets.CAMOUFOX_AUTH_SECRET }}
+      RELAY_URL: ${{ vars.CAMOUFOX_RELAY_URL || 'https://mohanadino.duckdns.org:8443/add' }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install Firefox runtime libraries
+        shell: bash
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends \
+            libasound2t64 libdbus-glib-1-2 libgbm1 libgtk-3-0 libnss3 \
+            libx11-xcb1 libxcomposite1 libxcursor1 libxdamage1 libxfixes3 \
+            libxi6 libxrandr2 libxrender1 libxss1 libxt6 libxtst6 \
+            fonts-liberation unzip
+
+      - name: Cache Camoufox v135 browser
+        id: browser-cache
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/camoufox
+          key: camoufox-135.0.1-beta.24-lin-x86_64-61e1ec455e021720
+
+      # `camoufox fetch` installs v152, which yields ZERO tokens on this sitekey
+      # (measured: 70x error 600010). The exact v135 build must be placed by hand.
+      - name: Install Camoufox 135.0.1-beta.24
+        if: steps.browser-cache.outputs.cache-hit != 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
+          url='https://github.com/daijro/camoufox/releases/download/v135.0.1-beta.24/camoufox-135.0.1-beta.24-lin.x86_64.zip'
+          expected='61e1ec455e021720af38a5cc5ff7566121363cb5b82b72f24e381ba2676a4888'
+          # The release CDN 504s for stretches longer than a curl --retry budget.
+          ok=""
+          for attempt in 1 2 3 4 5 6; do
+            if curl -fL --retry 3 --retry-delay 3 --retry-all-errors -C - \
+                 --connect-timeout 20 -o /tmp/camoufox.zip "$url"; then
+              if echo "$expected  /tmp/camoufox.zip" | sha256sum --check --strict; then ok=1; break; fi
+            fi
+            echo "attempt $attempt failed; backing off"; sleep $(( attempt * 10 ))
+          done
+          if [[ -z "$ok" ]]; then echo "could not download camoufox" >&2; exit 1; fi
+          rm -rf "$HOME/.cache/camoufox"; mkdir -p "$HOME/.cache/camoufox"
+          unzip -q /tmp/camoufox.zip -d "$HOME/.cache/camoufox"
+          printf '%s\n' '{"version":"135.0.1","release":"beta.24"}' > "$HOME/.cache/camoufox/version.json"
+          chmod -R u+rwX,go+rX "$HOME/.cache/camoufox"
+
+      - name: Install pinned Python packages
+        shell: bash
+        run: |
+          set -euo pipefail
+          python -m pip install --disable-pip-version-check \
+            'camoufox[geoip]==0.4.11' 'playwright==1.61.0'
+          python -c 'import camoufox, geoip2, playwright; print("imports=ok")'
+          "$HOME/.cache/camoufox/camoufox-bin" --version
+
+      - name: Install Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: "1.24"
+          cache: false
+
+      - name: Build the join verifier
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd experiments/egress/joinverify
+          go build -o "$RUNNER_TEMP/joinverify" .
+          echo "JOINVERIFY=$RUNNER_TEMP/joinverify" >> "$GITHUB_ENV"
+          "$RUNNER_TEMP/joinverify" '1.AAAAAAAAAAAAAAAAAAAA.BBBBBBBBBBBBBBBB' \
+            | sed 's/^/selftest(invalid-token, expect REJECTED code=5): /'
+
+      # This step MUST fail the run if the tunnel does not come up. Falling
+      # through to direct egress would produce nothing but 600010 for hours.
+      - name: Bring up Cloudflare WARP
+        shell: bash
+        run: |
+          set -euo pipefail
+          before=$(curl -4 -s --max-time 15 https://api.ipify.org)
+          echo "runner_egress=$before"
+          # The release CDN 504s in bursts that outlast a curl --retry budget.
+          dl() {
+            for attempt in 1 2 3 4 5 6; do
+              curl -fsSL --retry 3 --retry-delay 3 --retry-all-errors \
+                --connect-timeout 20 -o "$2" "$1" && return 0
+              echo "download attempt $attempt for $2 failed; backing off" >&2
+              sleep $(( attempt * 8 ))
+            done
+            return 1
+          }
+          dl https://github.com/ViRb3/wgcf/releases/download/v2.2.32/wgcf_2.2.32_linux_amd64 wgcf
+          chmod +x wgcf
+          # Anonymous registration: no signup, no credentials, no account to leak.
+          ./wgcf register --accept-tos
+          ./wgcf generate
+          dl https://github.com/pufferffish/wireproxy/releases/download/v1.1.3/wireproxy_linux_amd64.tar.gz wireproxy.tar.gz
+          tar xzf wireproxy.tar.gz
+          # Userspace WireGuard exposing a local SOCKS5 listener: no kernel
+          # module, no root, and the runner's own control traffic stays off the
+          # tunnel because only the browser is pointed at it.
+          cp wgcf-profile.conf wp.conf
+          printf '\n[Socks5]\nBindAddress = 127.0.0.1:25344\n' >> wp.conf
+          ./wireproxy -c wp.conf &
+          for _ in $(seq 1 30); do
+            curl -s --max-time 5 --socks5-hostname 127.0.0.1:25344 https://api.ipify.org >/dev/null && break
+            sleep 2
+          done
+          exit_ip=$(curl -s --max-time 15 --socks5-hostname 127.0.0.1:25344 https://api.ipify.org || true)
+          echo "warp_egress=${exit_ip:-FAILED}"
+          if [[ -z "$exit_ip" || "$exit_ip" == "$before" ]]; then
+            echo "WARP tunnel did not come up; refusing to mint on the runner IP" >&2
+            exit 1
+          fi
+          curl -s --max-time 15 --socks5-hostname 127.0.0.1:25344 \
+            https://www.cloudflare.com/cdn-cgi/trace | grep -E '^(ip|warp|loc)=' | sed 's/^/warp_/'
+          echo "PROXY=socks5://127.0.0.1:25344" >> "$GITHUB_ENV"
+
+      # Prove this exit actually produces ACCEPTED tokens before streaming
+      # anything to the relay. Cloudflare will happily issue tokens that gartic
+      # then refuses with code 5, and that failure is invisible producer-side.
+      - name: Preflight — mint one token and verify it joins
+        shell: bash
+        run: |
+          set -euo pipefail
+          python -u experiments/egress/probe.py \
+            --label preflight --duration 120 --max-tokens 2 \
+            --verify-count 1 --verifier "$JOINVERIFY" \
+            --result-file "$RUNNER_TEMP/preflight.json" \
+            --executable "$HOME/.cache/camoufox/camoufox-bin" --ff-version 135
+          python - "$RUNNER_TEMP/preflight.json" <<'PY'
+          import json, sys
+          result = json.load(open(sys.argv[1]))
+          joined = result.get("join_verdicts", {}).get("JOINED", 0)
+          print("preflight:", json.dumps(result, sort_keys=True))
+          if not joined:
+              sys.exit("preflight produced no ACCEPTED token — not feeding the relay")
+          PY
+
+      - name: Produce
+        shell: bash
+        run: |
+          set -uo pipefail
+          relay=""
+          if [[ '${{ inputs.post_to_relay }}' == 'true' ]]; then
+            relay="--relay-url $RELAY_URL"
+            if [[ -z "${AUTH_SECRET:-}" ]]; then
+              echo "post_to_relay=true but CAMOUFOX_AUTH_SECRET is unset" >&2; exit 1
+            fi
+          fi
+          python -u 'turnstile-system/token generators/camoufox-fresh/generator.py' \
+            --out /tmp/tokens.jsonl \
+            --label gh-warp \
+            --duration '${{ inputs.duration }}' \
+            --token-interval '${{ inputs.token_interval }}' \
+            --browser-lifetime 300 \
+            --reload-interval 120 \
+            --humanize \
+            --executable "$HOME/.cache/camoufox/camoufox-bin" \
+            --ff-version 135 \
+            $relay
+
+      - name: Report
+        if: always()
+        shell: bash
+        run: |
+          tokens=$(wc -l < /tmp/tokens.jsonl 2>/dev/null || echo 0)
+          echo "tokens produced = $tokens (posted to relay: ${{ inputs.post_to_relay }})"
+          echo "Webshare bandwidth used = 0"

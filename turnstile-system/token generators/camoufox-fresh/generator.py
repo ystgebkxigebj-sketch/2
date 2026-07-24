@@ -28,6 +28,7 @@ import asyncio
 import json
 import os
 import time
+import urllib.parse
 import urllib.request
 from pathlib import Path
 
@@ -87,6 +88,32 @@ def build_renderer(reset_delay_ms: int) -> str:
     )
 
 
+def parse_proxy(raw: str) -> dict:
+    """Accept ``scheme://[user:pass@]host:port`` or ``host:port[:user:pass]``.
+
+    The colon form is what the Webshare proxy lists hold. The URL form is what a
+    local tunnel listener needs, because it has to name a scheme other than
+    http — ``socks5://127.0.0.1:25344`` for WARP via wireproxy, for instance.
+    """
+    raw = raw.strip()
+    if "://" in raw:
+        parsed = urllib.parse.urlparse(raw)
+        if not parsed.hostname or not parsed.port:
+            raise SystemExit(f"PROXY url needs a host and port: {raw!r}")
+        proxy = {"server": f"{parsed.scheme}://{parsed.hostname}:{parsed.port}"}
+        if parsed.username:
+            proxy["username"] = urllib.parse.unquote(parsed.username)
+            proxy["password"] = urllib.parse.unquote(parsed.password or "")
+        return proxy
+    parts = raw.split(":", 3)
+    if len(parts) == 2:
+        return {"server": f"http://{parts[0]}:{parts[1]}"}
+    if len(parts) == 4:
+        return {"server": f"http://{parts[0]}:{parts[1]}",
+                "username": parts[2], "password": parts[3]}
+    raise SystemExit("PROXY must be scheme://host:port or HOST:PORT[:USER:PASS]")
+
+
 class Stats:
     """Counters shared across browser restarts for one run."""
 
@@ -138,24 +165,16 @@ async def run_session(args, stats: Stats, out_handle, deadline: float | None) ->
         launch["executable_path"] = str(Path(args.executable))
         launch["ff_version"] = args.ff_version
         launch["i_know_what_im_doing"] = True
-    # PROXY is HOST:PORT[:USER:PASS] — an HTTP CONNECT proxy, which keeps the
-    # page origin on gartic.io (a URL-rewriting proxy would not; see README).
+    # PROXY is either HOST:PORT[:USER:PASS] (the Webshare list format) or a URL
+    # like socks5://127.0.0.1:25344 (a local WireGuard/WARP or Tor listener).
+    # Both are transport-level, so the page origin stays gartic.io — a
+    # URL-rewriting proxy would not, and can never mint (see README).
     # geoip defaults ON whenever a proxy is used: Camoufox otherwise reports a
     # timezone/locale that contradicts the proxy's exit IP, and Cloudflare
     # refuses the challenge with 600010.
     proxy_raw = os.environ.get("PROXY", "").strip()
     if proxy_raw:
-        parts = proxy_raw.split(":", 3)
-        if len(parts) == 2:
-            launch["proxy"] = {"server": f"http://{parts[0]}:{parts[1]}"}
-        elif len(parts) == 4:
-            launch["proxy"] = {
-                "server": f"http://{parts[0]}:{parts[1]}",
-                "username": parts[2],
-                "password": parts[3],
-            }
-        else:
-            raise SystemExit("PROXY must be HOST:PORT or HOST:PORT:USER:PASS")
+        launch["proxy"] = parse_proxy(proxy_raw)
         launch["geoip"] = True
     if args.geoip:
         launch["geoip"] = True

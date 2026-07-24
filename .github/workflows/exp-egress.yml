@@ -238,12 +238,24 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          curl -fsSL -o wgcf https://github.com/ViRb3/wgcf/releases/download/v2.2.32/wgcf_2.2.32_linux_amd64
+          # The release CDN 504s in bursts that outlast a curl --retry budget,
+          # and a failed download here would silently mean "mint on the runner
+          # IP", so it has to be retried properly rather than tolerated.
+          dl() {
+            for attempt in 1 2 3 4 5 6; do
+              curl -fsSL --retry 3 --retry-delay 3 --retry-all-errors \
+                --connect-timeout 20 -o "$2" "$1" && return 0
+              echo "download attempt $attempt for $2 failed; backing off" >&2
+              sleep $(( attempt * 8 ))
+            done
+            return 1
+          }
+          dl https://github.com/ViRb3/wgcf/releases/download/v2.2.32/wgcf_2.2.32_linux_amd64 wgcf
           chmod +x wgcf
           # wgcf registers a free WARP account with no signup and no credentials.
           ./wgcf register --accept-tos
           ./wgcf generate
-          curl -fsSL -o wireproxy.tar.gz https://github.com/pufferffish/wireproxy/releases/download/v1.1.3/wireproxy_linux_amd64.tar.gz
+          dl https://github.com/pufferffish/wireproxy/releases/download/v1.1.3/wireproxy_linux_amd64.tar.gz wireproxy.tar.gz
           tar xzf wireproxy.tar.gz
           # wireproxy speaks WireGuard in userspace and exposes a local SOCKS5,
           # so no kernel module and no root are needed on the runner. It parses
