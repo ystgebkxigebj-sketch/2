@@ -98,7 +98,10 @@ jobs:
           echo "runner=${{ matrix.os }} arch=$(uname -m 2>/dev/null || echo win)"
           v4=$(curl -4 -s --max-time 15 https://api.ipify.org)
           echo "egress_v4=${v4:-NONE}"
-          v6=$(curl -6 -s --max-time 10 https://api64.ipify.org)
+          # -6 forces the family, so an answer here is real IPv6. Do NOT read
+          # api64.ipify.org without -6: it happily returns an IPv4 address when
+          # no IPv6 is available, which reads as "v6 present" and is not.
+          v6=$(curl -6 -s --max-time 10 https://api6.ipify.org)
           echo "egress_v6=${v6:-NONE}"
           echo "--- asn/org ---"
           curl -s --max-time 15 "https://ipinfo.io/${v4}/json" | tr -d '\n'; echo
@@ -191,6 +194,16 @@ jobs:
             *)       bin=$(find cfox -name 'camoufox-bin' | head -1) ;;
           esac
           if [[ -z "${bin:-}" ]]; then echo "camoufox binary not found:" >&2; find cfox -maxdepth 3 >&2; exit 1; fi
+          # The camoufox python package reads properties.json from the directory
+          # holding the executable. The macOS bundle keeps it elsewhere in the
+          # .app, so without this the launch raises FileNotFoundError and the
+          # package silently falls back to fetching v152 — which yields zero
+          # tokens on this sitekey and would look like an egress result.
+          props=$(find cfox -name 'properties.json' | head -1)
+          if [[ -n "$props" && "$(dirname "$props")" != "$(dirname "$bin")" ]]; then
+            cp "$props" "$(dirname "$bin")/"
+            echo "copied properties.json next to the launcher"
+          fi
           chmod -R u+rwX,go+rX cfox || true
           chmod +x "$bin" || true
           echo "CAMOUFOX_BIN=$PWD/$bin" >> "$GITHUB_ENV"
