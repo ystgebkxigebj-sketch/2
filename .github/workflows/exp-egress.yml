@@ -25,7 +25,7 @@ on:
         required: true
         default: all
         type: choice
-        options: [all, non-linux, ubuntu-24.04, macos-13, macos-latest, windows-latest]
+        options: [all, non-linux, ubuntu-24.04, ubuntu-24.04-arm, macos-13, macos-latest, windows-latest]
       tunnel:
         description: Egress tunnel to bring up before minting
         required: true
@@ -104,7 +104,11 @@ jobs:
           curl -s -o /dev/null -w 'api.js http=%{http_code} time=%{time_total}s\n' \
             --max-time 20 https://challenges.cloudflare.com/turnstile/v0/api.js
           echo "--- gartic reachability ---"
-          curl -s -o /dev/null -w 'gartic http=%{http_code}\n' --max-time 20 https://gartic.io/
+          # Not a bot-detection signal: a residential control line gets the same
+          # 403 here, because it is curl's TLS/UA fingerprint being refused, not
+          # the address. Only the browser run below can answer the real question.
+          curl -s -o /dev/null -w 'gartic(curl, expect 403 everywhere) http=%{http_code}\n' \
+            --max-time 20 https://gartic.io/
           exit 0
 
       - name: Install Python 3.11
@@ -131,6 +135,7 @@ jobs:
           set -euo pipefail
           base='https://github.com/daijro/camoufox/releases/download/v135.0.1-beta.24'
           case '${{ matrix.os }}' in
+            ubuntu-*-arm)   asset='camoufox-135.0.1-beta.24-lin.arm64.zip'  ;;
             ubuntu-*)       asset='camoufox-135.0.1-beta.24-lin.x86_64.zip' ;;
             macos-13)       asset='camoufox-135.0.1-beta.24-mac.x86_64.zip' ;;
             macos-latest)   asset='camoufox-135.0.1-beta.24-mac.arm64.zip'  ;;
@@ -138,7 +143,10 @@ jobs:
             *) echo "unmapped runner" >&2; exit 1 ;;
           esac
           echo "asset=$asset"
-          curl -fL --retry 3 -o camoufox.zip "$base/$asset"
+          # The release CDN intermittently serves 504 on these ~700 MB assets,
+          # which plain --retry does not treat as retryable.
+          curl -fL --retry 6 --retry-delay 5 --retry-all-errors \
+            --connect-timeout 20 -o camoufox.zip "$base/$asset"
           # Digest is recorded rather than asserted for the mac/win assets: only
           # the linux one has a published, already-pinned hash. Logging it here
           # is what makes pinning the others possible later.
@@ -172,10 +180,16 @@ jobs:
             'camoufox[geoip]==0.4.11' 'playwright==1.61.0'
           python -c 'import camoufox, geoip2, playwright; print("imports=ok")'
 
+      # Not preinstalled on the macOS arm64 image, so it cannot be assumed.
+      - name: Install Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: "1.22"
+          cache: false
+
       # The join replay has to be a separate Go binary: Python's TLS fingerprint
       # is refused by Cloudflare with 403 on the game-server socket, and opening
       # the socket inside the Camoufox page kills v135's Juggler connection.
-      # Go is preinstalled on every GitHub-hosted runner.
       - name: Build the join verifier
         shell: bash
         run: |
@@ -197,17 +211,16 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          curl -fsSL -o wgcf https://github.com/ViRb3/wgcf/releases/download/v2.2.29/wgcf_2.2.29_linux_amd64
+          curl -fsSL -o wgcf https://github.com/ViRb3/wgcf/releases/download/v2.2.32/wgcf_2.2.32_linux_amd64
           chmod +x wgcf
           # wgcf registers a free WARP account with no signup and no credentials.
           ./wgcf register --accept-tos
           ./wgcf generate
-          curl -fsSL -o wireproxy.tar.gz https://github.com/pufferffish/wireproxy/releases/download/v1.0.9/wireproxy_linux_amd64.tar.gz
+          curl -fsSL -o wireproxy.tar.gz https://github.com/pufferffish/wireproxy/releases/download/v1.1.3/wireproxy_linux_amd64.tar.gz
           tar xzf wireproxy.tar.gz
           # wireproxy speaks WireGuard in userspace and exposes a local SOCKS5,
-          # so no kernel module and no root are needed on the runner.
-          { cat wgcf-profile.conf | sed '/^\[Interface\]/,/^$/!d' | grep -vE '^(Address|DNS|MTU)'; \
-            echo; grep -A10 '^\[Peer\]' wgcf-profile.conf; } > wp.conf || cp wgcf-profile.conf wp.conf
+          # so no kernel module and no root are needed on the runner. It parses
+          # the wg-quick profile as-is; only the listener has to be appended.
           cp wgcf-profile.conf wp.conf
           printf '\n[Socks5]\nBindAddress = 127.0.0.1:25344\n' >> wp.conf
           ./wireproxy -c wp.conf &
