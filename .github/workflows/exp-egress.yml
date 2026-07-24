@@ -308,8 +308,20 @@ jobs:
             --duration '${{ inputs.duration }}' \
             --verify-count '${{ inputs.verify_count }}' \
             --verifier "$JOINVERIFY" \
+            --result-file "$RUNNER_TEMP/result.json" \
             --executable "$CAMOUFOX_BIN" \
             --ff-version 135 \
-            $extra 2>&1 | tee /tmp/probe.log
-          echo "----- verdict -----"
-          grep -a '^RESULT ' /tmp/probe.log || echo 'RESULT {"tokens":0,"note":"probe produced no RESULT line"}'
+            $extra
+
+      # Separate and always-run: the mint step's trailing stdout has been seen
+      # to go missing, and the whole point of the exercise is this one line.
+      - name: Verdict
+        if: always()
+        shell: bash
+        run: |
+          echo "===== ${{ matrix.os }} / tunnel=${{ inputs.tunnel }} ====="
+          if [[ -f "$RUNNER_TEMP/result.json" ]]; then
+            cat "$RUNNER_TEMP/result.json"; echo
+          else
+            echo '{"error":"probe wrote no result file"}'
+          fi

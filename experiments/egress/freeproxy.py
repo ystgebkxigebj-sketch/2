@@ -13,6 +13,8 @@ or dies on CONNECT is discarded before a browser is ever launched.
 from __future__ import annotations
 
 import concurrent.futures as futures
+import socket
+import ssl
 import re
 import sys
 import urllib.request
@@ -37,19 +39,48 @@ def fetch_list(url: str) -> list[str]:
     return [ln.strip() for ln in body.splitlines() if ENDPOINT.match(ln.strip())]
 
 
+def socks5_tunnels_tls(endpoint: str) -> bool:
+    """Full SOCKS5 negotiation, CONNECT, and a TLS request to the probe host.
+
+    A bare TCP connect is not evidence: most free SOCKS endpoints accept the
+    connection and then fail the negotiation or refuse CONNECT. Only completing
+    a real request proves the candidate is usable, and a browser launch is far
+    too expensive to spend on a guess.
+    """
+    host, _, port = endpoint.partition(":")
+    target = "challenges.cloudflare.com"
+    try:
+        with socket.create_connection((host, int(port)), timeout=8) as raw:
+            raw.settimeout(8)
+            raw.sendall(b"\x05\x01\x00")                     # greet, no auth
+            if raw.recv(2) != b"\x05\x00":
+                return False
+            request = (b"\x05\x01\x00\x03" + bytes([len(target)])
+                       + target.encode() + (443).to_bytes(2, "big"))
+            raw.sendall(request)
+            reply = raw.recv(4)
+            if len(reply) < 2 or reply[1] != 0x00:           # 0x00 = granted
+                return False
+            # Drain the bound-address field so the stream is positioned for TLS.
+            kind = reply[3] if len(reply) > 3 else 1
+            length = {1: 4, 4: 16}.get(kind)
+            if length is None:
+                length = raw.recv(1)[0]
+            raw.recv(length + 2)
+            context = ssl.create_default_context()
+            with context.wrap_socket(raw, server_hostname=target) as tls:
+                tls.sendall(f"HEAD /turnstile/v0/api.js HTTP/1.1\r\n"
+                            f"Host: {target}\r\nConnection: close\r\n\r\n".encode())
+                return b"HTTP/1." in tls.recv(64)
+    except Exception:
+        return False
+
+
 def works(scheme: str, endpoint: str) -> str | None:
     """A candidate qualifies only if it can tunnel TLS to the challenge host."""
     url = f"{scheme}://{endpoint}"
     if scheme == "socks5":
-        # urllib cannot do SOCKS; defer those to the browser, which can, but
-        # only after a raw TCP reachability check so we do not waste a launch.
-        import socket
-        host, _, port = endpoint.partition(":")
-        try:
-            with socket.create_connection((host, int(port)), timeout=6):
-                return url
-        except Exception:
-            return None
+        return url if socks5_tunnels_tls(endpoint) else None
     opener = urllib.request.build_opener(
         urllib.request.ProxyHandler({"https": url, "http": url})
     )

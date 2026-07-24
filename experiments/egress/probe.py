@@ -146,6 +146,7 @@ class Stats:
         self.verified = 0
         self.errors: dict[str, int] = {}
         self.verdicts: dict[str, int] = {}
+        self.nav: dict[str, object] = {}
         self.started = time.monotonic()
         self.last_token_at = time.monotonic()
 
@@ -240,9 +241,20 @@ async def run_session(args, stats: Stats, deadline: float | None) -> None:
         page.on("console", on_console)
 
         try:
-            await page.goto(TARGET_URL, wait_until="domcontentloaded", timeout=60_000)
+            response = await page.goto(TARGET_URL, wait_until="domcontentloaded",
+                                       timeout=45_000)
+            # Whether the document is really gartic.io or a Cloudflare block page
+            # decides how a 600010 should be read, so it must be recorded rather
+            # than assumed.
+            status = response.status if response else "none"
+            title = (await page.title())[:60]
+            length = await page.evaluate("() => document.documentElement.innerHTML.length")
+            print(f"  [nav] status={status} url={page.url[:60]} "
+                  f"title={title!r} html_len={length}", flush=True)
+            stats.nav = {"status": status, "title": title, "html_len": length}
         except Exception as error:
-            print(f"  [nav] {type(error).__name__}", flush=True)
+            print(f"  [nav] FAILED {type(error).__name__}", flush=True)
+            stats.nav = {"status": f"failed:{type(error).__name__}"}
         await asyncio.sleep(0.5)
         try:
             # gartic serves a Report-Only CSP; playwright surfaces that as an
@@ -298,6 +310,9 @@ async def main() -> int:
                         help="replay this many minted tokens through a real join")
     parser.add_argument("--verifier", default="",
                         help="path to the joinverify binary (empty = mint only)")
+    parser.add_argument("--result-file", default="",
+                        help="also write the RESULT json here, so a lost stdout "
+                             "tail cannot destroy the measurement")
     parser.add_argument("--geoip", action="store_true",
                         help="force geoip when egress is a default-route tunnel")
     parser.add_argument("--emit-tokens", action="store_true",
@@ -323,19 +338,33 @@ async def main() -> int:
             print(f"[session] {type(error).__name__}: {error}", flush=True)
             await asyncio.sleep(2)
 
-    elapsed = time.monotonic() - stats.started
-    # Printed before any teardown: camoufox v135 sometimes throws on close and
-    # the exception would otherwise swallow the result.
-    print("RESULT " + json.dumps({
+    emit_result(args, stats, proxy_desc)
+    return 0
+
+
+def emit_result(args, stats: Stats, proxy_desc: str) -> None:
+    """Report to stdout and, if asked, to a file.
+
+    The file is not redundant: a CI step's trailing stdout has been observed to
+    go missing when the probe is piped, and a measurement that cannot be read is
+    not a measurement.
+    """
+    payload = json.dumps({
         "label": args.label,
         "proxy": proxy_desc,
         "tokens": stats.tokens,
-        "elapsed_s": round(elapsed),
+        "elapsed_s": round(time.monotonic() - stats.started),
         "rate_per_min": round(stats.rate_per_min(), 2),
         "cf_errors": stats.errors,
         "join_verdicts": stats.verdicts,
-    }, sort_keys=True), flush=True)
-    return 0
+        "nav": stats.nav,
+    }, sort_keys=True)
+    print("RESULT " + payload, flush=True)
+    if args.result_file:
+        try:
+            Path(args.result_file).write_text(payload, encoding="utf-8")
+        except OSError as error:
+            print(f"[result-file] {type(error).__name__}", flush=True)
 
 
 if __name__ == "__main__":

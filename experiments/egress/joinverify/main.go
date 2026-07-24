@@ -48,7 +48,18 @@ func run(token string) string {
 	response.Body.Close()
 	body := string(raw)
 	if !strings.Contains(body, "?c=") || !strings.Contains(body, "https://") {
-		return "ERROR:no-server"
+		// The status and a body snippet distinguish "gartic refused this IP"
+		// from "the endpoint changed shape", which look identical otherwise.
+		snippet := strings.Map(func(r rune) rune {
+			if r == '\n' || r == '\r' || r == '\t' {
+				return ' '
+			}
+			return r
+		}, body)
+		if len(snippet) > 120 {
+			snippet = snippet[:120]
+		}
+		return fmt.Sprintf("ERROR:no-server:status=%d:body=%q", response.StatusCode, snippet)
 	}
 	server := strings.Split(strings.Split(body, "https://")[1], ".")[0]
 	code := strings.TrimSpace(strings.Split(body, "?c=")[1])
