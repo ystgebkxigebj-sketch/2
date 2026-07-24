@@ -1,0 +1,302 @@
+name: EXP egress
+
+# EXPERIMENT — never scheduled, never self-dispatching, never uses Webshare.
+#
+# Question: can a GitHub-hosted runner mint gartic-accepted Turnstile tokens
+# without a metered proxy?
+#
+# Established baseline (ubuntu-24.04, proxyless, camoufox-fresh config, runs
+# 30094383070 and 30094975321): tokens=0 with 121 and 130 x Cloudflare 600010.
+# Cloudflare refuses to serve the challenge to that runner's egress.
+#
+# This workflow re-asks the question from egress paths that baseline never
+# touched: the macOS and Windows runner fleets (different networks from the
+# Azure Linux pool), and userspace tunnels that move egress off GitHub
+# entirely. Each arm reports the three outcomes distinctly — challenge refused
+# (600010) / token issued but join rejected (code 5) / token accepted (JOINED).
+#
+# Deliberately absent: any successor dispatch. A dying run must not respawn.
+
+on:
+  workflow_dispatch:
+    inputs:
+      runners:
+        description: Which runner fleet(s) to test
+        required: true
+        default: all
+        type: choice
+        options: [all, non-linux, ubuntu-24.04, macos-13, macos-latest, windows-latest]
+      tunnel:
+        description: Egress tunnel to bring up before minting
+        required: true
+        default: none
+        type: choice
+        options: [none, warp, tor, vpngate, freeproxy]
+      duration:
+        description: Seconds to mint for
+        required: true
+        default: "300"
+      verify_count:
+        description: How many minted tokens to replay through a real gartic join
+        required: true
+        default: "3"
+      emit_tokens:
+        description: Print full tokens to this PUBLIC log (off-box verification only)
+        required: true
+        default: "false"
+        type: choice
+        options: ["false", "true"]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: exp-egress
+  cancel-in-progress: false
+
+jobs:
+  plan:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 2
+    outputs:
+      matrix: ${{ steps.pick.outputs.matrix }}
+    steps:
+      - id: pick
+        shell: bash
+        run: |
+          set -euo pipefail
+          case '${{ inputs.runners }}' in
+            all)       m='["ubuntu-24.04","macos-13","macos-latest","windows-latest"]' ;;
+            non-linux) m='["macos-13","macos-latest","windows-latest"]' ;;
+            *)         m='["${{ inputs.runners }}"]' ;;
+          esac
+          echo "matrix=$m" >> "$GITHUB_OUTPUT"
+          echo "matrix=$m"
+
+  mint:
+    needs: plan
+    strategy:
+      fail-fast: false
+      max-parallel: 4
+      matrix:
+        os: ${{ fromJSON(needs.plan.outputs.matrix) }}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    env:
+      PYTHONUNBUFFERED: "1"
+    steps:
+      - uses: actions/checkout@v4
+
+      # Recon runs before anything can fail, so even a broken arm reports the
+      # one fact that explains most outcomes: which network we are egressing on.
+      - name: Recon egress
+        shell: bash
+        run: |
+          set +e
+          echo "runner=${{ matrix.os }} arch=$(uname -m 2>/dev/null || echo win)"
+          v4=$(curl -4 -s --max-time 15 https://api.ipify.org)
+          echo "egress_v4=${v4:-NONE}"
+          v6=$(curl -6 -s --max-time 10 https://api64.ipify.org)
+          echo "egress_v6=${v6:-NONE}"
+          echo "--- asn/org ---"
+          curl -s --max-time 15 "https://ipinfo.io/${v4}/json" | tr -d '\n'; echo
+          echo "--- turnstile api.js reachability ---"
+          curl -s -o /dev/null -w 'api.js http=%{http_code} time=%{time_total}s\n' \
+            --max-time 20 https://challenges.cloudflare.com/turnstile/v0/api.js
+          echo "--- gartic reachability ---"
+          curl -s -o /dev/null -w 'gartic http=%{http_code}\n' --max-time 20 https://gartic.io/
+          exit 0
+
+      - name: Install Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install Firefox runtime libraries (Linux only)
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends \
+            libasound2t64 libdbus-glib-1-2 libgbm1 libgtk-3-0 libnss3 \
+            libx11-xcb1 libxcomposite1 libxcursor1 libxdamage1 libxfixes3 \
+            libxi6 libxrandr2 libxrender1 libxss1 libxt6 libxtst6 \
+            fonts-liberation unzip
+
+      # `camoufox fetch` installs v152, which yields ZERO tokens on this sitekey
+      # (measured: 70x error 600010). The exact v135 build is placed by hand.
+      - name: Install Camoufox 135.0.1-beta.24
+        shell: bash
+        run: |
+          set -euo pipefail
+          base='https://github.com/daijro/camoufox/releases/download/v135.0.1-beta.24'
+          case '${{ matrix.os }}' in
+            ubuntu-*)       asset='camoufox-135.0.1-beta.24-lin.x86_64.zip' ;;
+            macos-13)       asset='camoufox-135.0.1-beta.24-mac.x86_64.zip' ;;
+            macos-latest)   asset='camoufox-135.0.1-beta.24-mac.arm64.zip'  ;;
+            windows-latest) asset='camoufox-135.0.1-beta.24-win.x86_64.zip' ;;
+            *) echo "unmapped runner" >&2; exit 1 ;;
+          esac
+          echo "asset=$asset"
+          curl -fL --retry 3 -o camoufox.zip "$base/$asset"
+          # Digest is recorded rather than asserted for the mac/win assets: only
+          # the linux one has a published, already-pinned hash. Logging it here
+          # is what makes pinning the others possible later.
+          python -c "import hashlib,sys;print('sha256='+hashlib.sha256(open('camoufox.zip','rb').read()).hexdigest())"
+          mkdir -p cfox
+          if [[ '${{ runner.os }}' == 'Windows' ]]; then
+            powershell -NoProfile -Command "Expand-Archive -Path camoufox.zip -DestinationPath cfox -Force"
+          else
+            unzip -q camoufox.zip -d cfox
+          fi
+          if [[ '${{ runner.os }}' == 'macOS' ]]; then
+            xattr -dr com.apple.quarantine cfox || true
+          fi
+          # Locate the launcher rather than hardcoding a per-OS layout.
+          case '${{ runner.os }}' in
+            Windows) bin=$(find cfox -name 'camoufox.exe' | head -1) ;;
+            macOS)   bin=$(find cfox -path '*Contents/MacOS/camoufox' | head -1) ;;
+            *)       bin=$(find cfox -name 'camoufox-bin' | head -1) ;;
+          esac
+          if [[ -z "${bin:-}" ]]; then echo "camoufox binary not found:" >&2; find cfox -maxdepth 3 >&2; exit 1; fi
+          chmod -R u+rwX,go+rX cfox || true
+          chmod +x "$bin" || true
+          echo "CAMOUFOX_BIN=$PWD/$bin" >> "$GITHUB_ENV"
+          echo "found $bin"
+
+      - name: Install pinned Python packages
+        shell: bash
+        run: |
+          set -euo pipefail
+          python -m pip install --disable-pip-version-check \
+            'camoufox[geoip]==0.4.11' 'playwright==1.61.0'
+          python -c 'import camoufox, geoip2, playwright; print("imports=ok")'
+
+      # The join replay has to be a separate Go binary: Python's TLS fingerprint
+      # is refused by Cloudflare with 403 on the game-server socket, and opening
+      # the socket inside the Camoufox page kills v135's Juggler connection.
+      # Go is preinstalled on every GitHub-hosted runner.
+      - name: Build the join verifier
+        shell: bash
+        run: |
+          set -euo pipefail
+          go version
+          cd experiments/egress/joinverify
+          go build -o "$RUNNER_TEMP/joinverify" .
+          echo "JOINVERIFY=$RUNNER_TEMP/joinverify" >> "$GITHUB_ENV"
+          # Self-test with a deliberately invalid token. A working verifier must
+          # answer REJECTED code=5; anything else means the verdicts below would
+          # be measuring the verifier, not the tokens.
+          "$RUNNER_TEMP/joinverify" '1.AAAAAAAAAAAAAAAAAAAA.BBBBBBBBBBBBBBBB' \
+            | sed 's/^/selftest(invalid-token): /'
+
+      # ---- tunnel arms (Linux only; all userspace, no account, no Webshare) ----
+
+      - name: Bring up Cloudflare WARP (wgcf + wireproxy)
+        if: inputs.tunnel == 'warp'
+        shell: bash
+        run: |
+          set -euo pipefail
+          curl -fsSL -o wgcf https://github.com/ViRb3/wgcf/releases/download/v2.2.29/wgcf_2.2.29_linux_amd64
+          chmod +x wgcf
+          # wgcf registers a free WARP account with no signup and no credentials.
+          ./wgcf register --accept-tos
+          ./wgcf generate
+          curl -fsSL -o wireproxy.tar.gz https://github.com/pufferffish/wireproxy/releases/download/v1.0.9/wireproxy_linux_amd64.tar.gz
+          tar xzf wireproxy.tar.gz
+          # wireproxy speaks WireGuard in userspace and exposes a local SOCKS5,
+          # so no kernel module and no root are needed on the runner.
+          { cat wgcf-profile.conf | sed '/^\[Interface\]/,/^$/!d' | grep -vE '^(Address|DNS|MTU)'; \
+            echo; grep -A10 '^\[Peer\]' wgcf-profile.conf; } > wp.conf || cp wgcf-profile.conf wp.conf
+          cp wgcf-profile.conf wp.conf
+          printf '\n[Socks5]\nBindAddress = 127.0.0.1:25344\n' >> wp.conf
+          ./wireproxy -c wp.conf &
+          for i in $(seq 1 30); do
+            if curl -s --max-time 5 --socks5-hostname 127.0.0.1:25344 https://api.ipify.org >/dev/null; then break; fi
+            sleep 2
+          done
+          warp_ip=$(curl -s --max-time 15 --socks5-hostname 127.0.0.1:25344 https://api.ipify.org)
+          echo "warp_egress=${warp_ip:-FAILED}"
+          curl -s --max-time 15 --socks5-hostname 127.0.0.1:25344 https://www.cloudflare.com/cdn-cgi/trace | grep -E '^(ip|warp|loc)=' || true
+          if [[ -z "${warp_ip:-}" ]]; then echo "WARP tunnel did not come up" >&2; exit 1; fi
+          echo "PROXY=socks5://127.0.0.1:25344" >> "$GITHUB_ENV"
+
+      - name: Bring up Tor
+        if: inputs.tunnel == 'tor'
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo apt-get install -y --no-install-recommends tor
+          sudo systemctl start tor || sudo service tor start || (tor &)
+          for i in $(seq 1 30); do
+            if curl -s --max-time 5 --socks5-hostname 127.0.0.1:9050 https://api.ipify.org >/dev/null; then break; fi
+            sleep 2
+          done
+          tor_ip=$(curl -s --max-time 20 --socks5-hostname 127.0.0.1:9050 https://api.ipify.org)
+          echo "tor_egress=${tor_ip:-FAILED}"
+          if [[ -z "${tor_ip:-}" ]]; then echo "Tor did not come up" >&2; exit 1; fi
+          echo "PROXY=socks5://127.0.0.1:9050" >> "$GITHUB_ENV"
+
+      - name: Bring up VPN Gate (free public OpenVPN relays)
+        if: inputs.tunnel == 'vpngate'
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo apt-get install -y --no-install-recommends openvpn
+          curl -fsSL -o vpngate.csv https://www.vpngate.net/api/iphone/
+          python3 experiments/egress/vpngate.py vpngate.csv /tmp/vpn
+          before=$(curl -4 -s --max-time 10 https://api.ipify.org)
+          echo "egress_before=$before"
+          ok=""
+          for cfg in /tmp/vpn/*.ovpn; do
+            echo "--- trying $(basename "$cfg") ---"
+            sudo openvpn --config "$cfg" --daemon --log /tmp/ovpn.log \
+              --connect-timeout 15 --connect-retry-max 1 || continue
+            for i in $(seq 1 20); do
+              now=$(curl -4 -s --max-time 5 https://api.ipify.org || true)
+              if [[ -n "$now" && "$now" != "$before" ]]; then ok="$now"; break; fi
+              sleep 2
+            done
+            if [[ -n "$ok" ]]; then echo "vpn_egress=$ok"; break; fi
+            sudo pkill openvpn || true; sleep 2
+          done
+          if [[ -z "$ok" ]]; then echo "no VPN Gate relay came up"; tail -30 /tmp/ovpn.log || true; exit 1; fi
+          curl -s --max-time 15 "https://ipinfo.io/${ok}/json" | tr -d '\n'; echo
+          # Egress is now the tunnel by default route — no PROXY needed. geoip is
+          # therefore NOT auto-enabled, so force the fingerprint to match the exit.
+          echo "PROXY=" >> "$GITHUB_ENV"
+
+      - name: Harvest a working free CONNECT proxy
+        if: inputs.tunnel == 'freeproxy'
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 experiments/egress/freeproxy.py > /tmp/proxy.txt
+          picked=$(cat /tmp/proxy.txt)
+          if [[ -z "$picked" ]]; then echo "no free proxy passed the liveness check" >&2; exit 1; fi
+          echo "picked a free proxy (masked)"
+          echo "::add-mask::$picked"
+          echo "PROXY=$picked" >> "$GITHUB_ENV"
+
+      - name: Mint and verify
+        id: probe
+        continue-on-error: true
+        shell: bash
+        run: |
+          set -uo pipefail
+          extra=""
+          if [[ '${{ inputs.emit_tokens }}' == 'true' ]]; then extra="--emit-tokens"; fi
+          # OpenVPN moves the default route instead of setting PROXY, so geoip
+          # has to be asked for explicitly or the fingerprint keeps the runner's
+          # UTC timezone against a JP exit — a 600010 trigger on its own.
+          if [[ '${{ inputs.tunnel }}' == 'vpngate' ]]; then extra="$extra --geoip"; fi
+          python -u experiments/egress/probe.py \
+            --label '${{ matrix.os }}/${{ inputs.tunnel }}' \
+            --duration '${{ inputs.duration }}' \
+            --verify-count '${{ inputs.verify_count }}' \
+            --verifier "$JOINVERIFY" \
+            --executable "$CAMOUFOX_BIN" \
+            --ff-version 135 \
+            $extra 2>&1 | tee /tmp/probe.log
+          echo "----- verdict -----"
+          grep -a '^RESULT ' /tmp/probe.log || echo 'RESULT {"tokens":0,"note":"probe produced no RESULT line"}'
