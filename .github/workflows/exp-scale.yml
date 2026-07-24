@@ -171,7 +171,7 @@ jobs:
           chmod +x experiments/egress/warp_up.sh
           experiments/egress/warp_up.sh 25344 "$host" "$port" | tee /tmp/warp.txt | sed 's/^/WARP_/'
           echo "PROXY=socks5://127.0.0.1:25344" >> "$GITHUB_ENV"
-          echo "EXITIP=$(sed -n 's/^exit_ip=//p' /tmp/warp.txt)" >> "$GITHUB_ENV"
+          echo "EXITIP=$(sed -n 's/^exit_v4=//p' /tmp/warp.txt | tail -1)/$(sed -n 's/^colo=//p' /tmp/warp.txt | tail -1)" >> "$GITHUB_ENV"
 
       - name: Bring up VPN Gate (relay slice ${{ matrix.idx }}/${{ inputs.fanout }})
         if: inputs.tunnel == 'vpngate'
