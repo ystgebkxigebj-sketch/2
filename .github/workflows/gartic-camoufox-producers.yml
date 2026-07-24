@@ -1,5 +1,10 @@
 name: Gartic Camoufox producers
-run-name: ${{ inputs.producers }}x ${{ inputs.tunnel }} for ${{ inputs.duration }}s (relay=${{ inputs.post_to_relay }})
+# The supervisor parses this title, so its shape is load-bearing:
+#   "<tunnel> x<producers> <duration>s relay=<bool> via=<who>"
+# See TITLE_RE in camoufox-fresh/fleet_master.py. `via=supervisor` is also the
+# marker that makes a run eligible to be cancelled by the supervisor; a manual
+# dispatch counts toward the fleet but is never touched by it.
+run-name: ${{ inputs.tunnel }} x${{ inputs.producers }} ${{ inputs.duration }}s relay=${{ inputs.post_to_relay }} via=${{ inputs.dispatched_by }}
 
 # Token producer that costs ZERO metered proxy bandwidth.
 #
@@ -30,10 +35,17 @@ run-name: ${{ inputs.producers }}x ${{ inputs.tunnel }} for ${{ inputs.duration 
 # WARP exit IP between producers was measured to cost nothing, so the fleet does
 # not need distinct exits to scale.
 #
-# Not scheduled on purpose — nothing here self-dispatches, because a dying run's
-# successor dispatch is what caused the previous runaway-respawn incident. The
-# operator dispatches deliberately. Read
-# `oracle server/research/github-no-webshare.md` before adding a cron.
+# NOTHING HERE SELF-DISPATCHES, and nothing here has a cron. That is deliberate
+# and permanent: a dying run's `if: always()` successor dispatch is what caused
+# the runaway-respawn incident that burned ~15 runs before it could be stopped.
+#
+# Sustained 24/7 coverage is instead driven by `camoufox-free-supervisor.yml`,
+# which is the ONLY thing that dispatches this workflow on a schedule and which
+# refuses to dispatch at all unless the repo variable CAMOUFOX_FLEET_ENABLED is
+# exactly "true". To stop the fleet, see the stop procedure at the top of that
+# workflow — the order (disable, THEN cancel) is what makes it work.
+#
+# Read `oracle server/research/github-no-webshare.md` before changing any of it.
 
 on:
   workflow_dispatch:
@@ -45,11 +57,18 @@ on:
         type: choice
         options: [warp, vpngate]
       producers:
-        description: Concurrent producers (~40 tok/min each on warp, ~19 on vpngate)
+        description: Concurrent producers in THIS dispatch (~40 tok/min each on warp, ~19 on vpngate)
         required: true
         default: "2"
         type: choice
-        options: ["1", "2", "3", "4", "5", "6"]
+        # Capped at the account's MEASURED concurrent-job ceiling, which is 9 —
+        # not the 20 the GitHub Free docs quote. Measured 2026-07-24 by queueing
+        # 32 then 24 trivial jobs with no max-parallel and reading the peak
+        # overlap from the jobs API: three clean waves of exactly 9.
+        # 9 saturates the account and starves the supervisor's own tick, so it
+        # is here for deliberate one-off bursts only; the 24/7 fleet target is
+        # CAMOUFOX_FLEET_TARGET and is held below this on purpose.
+        options: ["1", "2", "3", "4", "5", "6", "7", "8", "9"]
       duration:
         description: Seconds to mint for (job timeout is 350 min, GitHub caps jobs at 6 h)
         required: true
@@ -64,39 +83,43 @@ on:
         default: "false"
         type: choice
         options: ["false", "true"]
+      verify_every:
+        description: Seconds between acceptance-sampled tokens (0 = none). Sampled tokens are diverted, never relayed.
+        required: false
+        default: "180"
+      dispatched_by:
+        description: Who asked for this run (the supervisor sets 'supervisor')
+        required: false
+        default: manual
 
 permissions:
   contents: read
 
-# Keyed by tunnel so a warp fleet and a vpngate fleet can run side by side. The
-# producers WITHIN a dispatch are matrix jobs, so one dispatch launches the whole
-# fleet rather than queueing behind itself.
-concurrency:
-  group: camoufox-producers-${{ inputs.tunnel }}
-  cancel-in-progress: false
+# NO `concurrency:` block, on purpose.
+#
+# The supervisor keeps the fleet full by running N INDEPENDENT single-producer
+# runs and overlapping each one's replacement with its predecessor. Any
+# concurrency group shared across those runs would serialise them — with
+# `cancel-in-progress: false` GitHub would queue the whole fleet behind one run,
+# and with `true` it would cancel the incumbent, which is the opposite of
+# overlap. Fleet size is bounded by the supervisor's --target and --hard-cap,
+# and stopped by CAMOUFOX_FLEET_ENABLED; those are the controls, not this.
 
 jobs:
-  plan:
-    runs-on: ubuntu-24.04
-    timeout-minutes: 2
-    outputs:
-      matrix: ${{ steps.pick.outputs.matrix }}
-    steps:
-      - id: pick
-        shell: bash
-        run: |
-          set -euo pipefail
-          m=$(python3 -c "print(__import__('json').dumps(list(range(1, ${{ inputs.producers }}+1))))")
-          echo "matrix=$m" >> "$GITHUB_OUTPUT"
-          echo "matrix=$m"
-
+  # There is deliberately no `plan` job computing this matrix.
+  #
+  # The account's real ceiling is 9 concurrent jobs (measured), and a separate
+  # planner job spends one of them on every single dispatch — which, with the
+  # supervisor dispatching a replacement producer several times a day, is a slot
+  # taken away from minting for no benefit. GitHub expressions have no range
+  # function, so the fan-out is a literal lookup table instead. Ugly, but it is
+  # one job instead of two and it cannot fail at runtime.
   produce:
-    needs: plan
     strategy:
       fail-fast: false
-      max-parallel: 6
+      max-parallel: 9
       matrix:
-        idx: ${{ fromJSON(needs.plan.outputs.matrix) }}
+        idx: ${{ fromJSON('{"1":[1],"2":[1,2],"3":[1,2,3],"4":[1,2,3,4],"5":[1,2,3,4,5],"6":[1,2,3,4,5,6],"7":[1,2,3,4,5,6,7],"8":[1,2,3,4,5,6,7,8],"9":[1,2,3,4,5,6,7,8,9]}')[inputs.producers] }}
     runs-on: ubuntu-24.04
     timeout-minutes: 350
     env:
@@ -197,7 +220,14 @@ jobs:
           # is available insurance rather than a requirement.
           experiments/egress/warp_up.sh 25344 | tee /tmp/warp.txt | sed 's/^/warp_/'
           echo "PROXY=socks5://127.0.0.1:25344" >> "$GITHUB_ENV"
+          # BOTH families, deliberately. cdn-cgi/trace reports the IPv6 exit over
+          # WARP, and every registration gets its own v6 address out of a
+          # /32-sized space while the v4 pool per colo is far smaller. Comparing
+          # the wrong family makes an exit-collision check silently useless, so
+          # the fleet's diversity measurement needs both.
           echo "EXITIP=$(sed -n 's/^exit_v4=//p' /tmp/warp.txt | tail -1)" >> "$GITHUB_ENV"
+          echo "EXITV6=$(sed -n 's/^exit_ip=//p' /tmp/warp.txt | tail -1)" >> "$GITHUB_ENV"
+          echo "COLO=$(sed -n 's/^colo=//p' /tmp/warp.txt | tail -1)" >> "$GITHUB_ENV"
           # A working verifier must answer REJECTED code=5 for a bogus token;
           # anything else means the preflight below is measuring itself.
           "$JOINVERIFY" -proxy socks5://127.0.0.1:25344 '1.AAAAAAAAAAAA.BBBBBBBB'             | sed 's/^/selftest over tunnel (invalid token): /'
@@ -280,6 +310,18 @@ jobs:
           fi
           geo=""
           if [[ '${{ inputs.tunnel }}' == 'vpngate' ]]; then geo="--geoip"; fi
+          # Acceptance sampling, spread over the WHOLE run. The preflight above
+          # only proves the exit was good at minute zero; Cloudflare will keep
+          # issuing tokens long after gartic has started refusing them, and no
+          # other line this job prints can see that. Sampled tokens are DIVERTED
+          # — never written out, never relayed — because tokens are single-use
+          # and verifying one that also reached the relay would hand the queue a
+          # token that can only fail.
+          verify=""
+          if [[ '${{ inputs.verify_every }}' != '0' && -n '${{ inputs.verify_every }}' ]]; then
+            verify="--verifier $JOINVERIFY --verify-every ${{ inputs.verify_every }}"
+            if [[ -n "${PROXY:-}" ]]; then verify="$verify --verifier-proxy $PROXY"; fi
+          fi
           python -u 'turnstile-system/token generators/camoufox-fresh/generator.py' \
             --out /tmp/tokens.jsonl \
             --label "gh-${{ inputs.tunnel }}-${{ matrix.idx }}" \
@@ -290,7 +332,7 @@ jobs:
             --humanize $geo \
             --executable "$HOME/.cache/camoufox/camoufox-bin" \
             --ff-version 135 \
-            $relay
+            $verify $relay 2>&1 | tee /tmp/produce.log
 
       - name: Report
         if: always()
@@ -298,7 +340,18 @@ jobs:
         run: |
           tokens=$(wc -l < /tmp/tokens.jsonl 2>/dev/null || echo 0)
           secs='${{ inputs.duration }}'
-          echo "producer ${{ matrix.idx }}/${{ inputs.producers }} tunnel=${{ inputs.tunnel }} exit=${EXITIP:-unknown}"
+          echo "producer ${{ matrix.idx }}/${{ inputs.producers }} tunnel=${{ inputs.tunnel }}"
+          echo "exit_v4=${EXITIP:-unknown} exit_v6=${EXITV6:-unknown} colo=${COLO:-unknown}"
           echo "tokens produced = $tokens over ${secs}s (posted to relay: ${{ inputs.post_to_relay }})"
           python3 -c "print('rate = %.1f tok/min' % ($tokens/max(int('$secs'),1)*60))" 2>/dev/null || true
           echo "Webshare bandwidth used = 0"
+          # One machine-readable line per producer. Acceptance is a RATIO of real
+          # joins; the token count above says nothing about whether gartic will
+          # take them. Emitted with the exit identity attached so a scale run can
+          # correlate rate against exit concentration.
+          line=$(grep -a '^PRODUCER ' /tmp/produce.log 2>/dev/null | tail -1)
+          if [[ -n "$line" ]]; then
+            python3 -c "import json,os,sys;r=json.loads(sys.argv[1][9:]);r.update(exit_v4=os.environ.get('EXITIP','unknown'),exit_v6=os.environ.get('EXITV6','unknown'),colo=os.environ.get('COLO','unknown'),idx=int(os.environ.get('IDX','0')),fanout=int(os.environ.get('FANOUT','0')));print('FLEET '+json.dumps(r,sort_keys=True))" "$line"
+          else
+            echo "FLEET {\"error\":\"producer emitted no summary\",\"exit_v4\":\"${EXITIP:-unknown}\",\"idx\":${IDX:-0}}"
+          fi

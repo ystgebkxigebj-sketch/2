@@ -27,6 +27,7 @@ import argparse
 import asyncio
 import json
 import os
+import subprocess
 import time
 import urllib.parse
 import urllib.request
@@ -114,6 +115,33 @@ def parse_proxy(raw: str) -> dict:
     raise SystemExit("PROXY must be scheme://host:port or HOST:PORT[:USER:PASS]")
 
 
+def verify_token(verifier: str, token: str, via_proxy: str = "") -> str:
+    """Replay one token through gartic's real join handshake via the Go helper.
+
+    Returns "JOINED", "REJECTED code=N", "TIMEOUT" or "ERROR:...". The work is
+    delegated to a subprocess because neither in-process option survives contact
+    with reality: a Python websocket handshake to serverNN.gartic.io is refused
+    by Cloudflare with 403 on TLS fingerprint alone, and opening the socket from
+    inside the Camoufox page tears down v135's Juggler connection.
+    """
+    command = [verifier]
+    if via_proxy:
+        # gartic's WAF answers the server-discovery endpoint with a 403 block
+        # page from some datacenter addresses. Checking over the same tunnel the
+        # token was minted on keeps that out of the measurement.
+        command += ["-proxy", via_proxy]
+    try:
+        completed = subprocess.run(
+            command + [token], capture_output=True, text=True, timeout=60,
+        )
+    except subprocess.TimeoutExpired:
+        return "ERROR:verifier-timeout"
+    except OSError as error:
+        return f"ERROR:verifier-spawn:{type(error).__name__}"
+    output = (completed.stdout or "").strip().splitlines()
+    return output[-1].strip() if output else "ERROR:verifier-silent"
+
+
 class Stats:
     """Counters shared across browser restarts for one run."""
 
@@ -122,6 +150,14 @@ class Stats:
         self.errors: dict[str, int] = {}
         self.started = time.monotonic()
         self.last_token_at = time.monotonic()
+        # Acceptance sampling. `verdicts` is the only honest health metric: a
+        # producer at full token rate with 0% acceptance looks perfectly healthy
+        # in every other line it prints.
+        self.verdicts: dict[str, int] = {}
+        self.verified = 0
+        self.diverted = 0
+        self.last_verify_at = 0.0
+        self.pending: list[asyncio.Future] = []
 
     def rate_per_min(self) -> float:
         elapsed = time.monotonic() - self.started
@@ -129,6 +165,12 @@ class Stats:
 
     def note_error(self, code: str) -> None:
         self.errors[code] = self.errors.get(code, 0) + 1
+
+    def acceptance(self) -> str:
+        total = sum(self.verdicts.values())
+        if not total:
+            return "0/0"
+        return f"{self.verdicts.get('JOINED', 0)}/{total}"
 
 
 async def _block_irrelevant(route):
@@ -194,9 +236,53 @@ async def run_session(args, stats: Stats, out_handle, deadline: float | None) ->
             if text.startswith("T:"):
                 token = text[2:]
                 now = time.time()
-                gap = time.monotonic() - stats.last_token_at
-                stats.last_token_at = time.monotonic()
+                mono = time.monotonic()
+                gap = mono - stats.last_token_at
+                stats.last_token_at = mono
                 stats.tokens += 1
+
+                # Acceptance sampling. A sampled token is DIVERTED: it is never
+                # written out and never posted to the relay. Tokens are
+                # single-use, so verifying one that also reached the relay would
+                # burn it and hand the queue a token that can only fail — the
+                # measurement would poison the thing it is measuring.
+                sample = (
+                    args.verify_every > 0
+                    and args.verifier
+                    and (mono - stats.last_verify_at) >= args.verify_every
+                    and (args.verify_max == 0 or stats.verified < args.verify_max)
+                )
+                if sample:
+                    stats.last_verify_at = mono
+                    stats.verified += 1
+                    stats.diverted += 1
+                    index = stats.verified
+                    elapsed = mono - stats.started
+                    loop = asyncio.get_running_loop()
+
+                    async def check(tok=token, idx=index, at=elapsed):
+                        verdict = await loop.run_in_executor(
+                            None, verify_token, args.verifier, tok,
+                            args.verifier_proxy,
+                        )
+                        key = (verdict.split(":")[0] if verdict.startswith("ERROR")
+                               else verdict)
+                        stats.verdicts[key] = stats.verdicts.get(key, 0) + 1
+                        print(
+                            f"  VERIFY[{idx}] t=+{at:.0f}s {verdict} "
+                            f"(accept {stats.acceptance()})",
+                            flush=True,
+                        )
+
+                    stats.pending.append(asyncio.ensure_future(check()))
+                    print(
+                        f"[{stats.tokens:3d}] +{gap:5.1f}s  len={len(token)}  "
+                        f"rate={stats.rate_per_min():.1f}/min  "
+                        f"errs={sum(stats.errors.values())}  [diverted->verify]",
+                        flush=True,
+                    )
+                    return
+
                 record = {
                     "ts": now,
                     "label": args.label,
@@ -212,7 +298,8 @@ async def run_session(args, stats: Stats, out_handle, deadline: float | None) ->
                     )
                 print(
                     f"[{stats.tokens:3d}] +{gap:5.1f}s  len={len(token)}  "
-                    f"rate={stats.rate_per_min():.1f}/min  errs={sum(stats.errors.values())}",
+                    f"rate={stats.rate_per_min():.1f}/min  errs={sum(stats.errors.values())}"
+                    f"  accept={stats.acceptance()}",
                     flush=True,
                 )
             elif text.startswith("E:"):
@@ -312,11 +399,31 @@ async def main() -> int:
                              "(needs AUTH_SECRET in the environment). Empty = "
                              "local capture only, which is the default so test "
                              "runs never pollute the live queue.")
+    # Acceptance sampling — off by default so existing callers are unchanged.
+    parser.add_argument("--verifier", default="",
+                        help="path to the joinverify/joindebug binary. Enables "
+                             "in-run acceptance sampling: Cloudflare will issue "
+                             "tokens that gartic then refuses with code 5, and "
+                             "nothing else a producer prints can see that.")
+    parser.add_argument("--verifier-proxy", default="",
+                        help="send the verification join through this proxy, so "
+                             "a WAF block on the host's own address is not "
+                             "misread as a rejected token")
+    parser.add_argument("--verify-every", type=float, default=0,
+                        help="seconds between sampled tokens (0 = no sampling). "
+                             "Sampling is spread over the WHOLE run on purpose: "
+                             "verifying only the first N tokens cannot see a "
+                             "mid-run acceptance collapse, which is this "
+                             "pipeline's known silent failure mode.")
+    parser.add_argument("--verify-max", type=int, default=0,
+                        help="stop sampling after this many tokens (0 = no cap)")
     args = parser.parse_args()
 
     args.auth_secret = os.environ.get("AUTH_SECRET", "").strip()
     if args.relay_url and not args.auth_secret:
         parser.error("--relay-url needs AUTH_SECRET in the environment")
+    if args.verify_every and not args.verifier:
+        parser.error("--verify-every needs --verifier")
 
     args.out.parent.mkdir(parents=True, exist_ok=True)
     stats = Stats()
@@ -347,11 +454,36 @@ async def main() -> int:
         except KeyboardInterrupt:
             pass
 
+    # Let sampled verifications land before summarising, or the acceptance
+    # ratio silently under-reports whatever was still in flight at the deadline.
+    if stats.pending:
+        try:
+            await asyncio.wait(stats.pending, timeout=75)
+        except Exception:  # noqa: BLE001 - a stuck verifier must not eat the summary
+            pass
+
     elapsed = time.monotonic() - stats.started
     print(
         f"\n[summary] label={args.label} tokens={stats.tokens} "
         f"elapsed={elapsed:.0f}s rate={stats.rate_per_min():.2f}/min "
         f"cf_errors={stats.errors or '{}'}",
+        flush=True,
+    )
+    # Machine-readable, one line, always emitted — this is what the fleet's
+    # scale measurements are read from. Acceptance is a RATIO of real joins;
+    # a token count says nothing about whether gartic will take them.
+    print(
+        "PRODUCER " + json.dumps({
+            "label": args.label,
+            "tokens": stats.tokens,
+            "elapsed_s": round(elapsed, 1),
+            "rate_per_min": round(stats.rate_per_min(), 2),
+            "cf_errors": stats.errors,
+            "join_verdicts": stats.verdicts,
+            "accepted": stats.verdicts.get("JOINED", 0),
+            "verified": sum(stats.verdicts.values()),
+            "diverted": stats.diverted,
+        }, sort_keys=True),
         flush=True,
     )
     return 0

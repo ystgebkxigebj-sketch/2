@@ -159,6 +159,9 @@ class Stats:
         self.nav: dict[str, object] = {}
         self.started = time.monotonic()
         self.last_token_at = time.monotonic()
+        # Sampling clock. Kept on Stats rather than in run_session because the
+        # browser is restarted mid-run and the sampling cadence must survive it.
+        self.last_verify_at = 0.0
 
     def rate_per_min(self) -> float:
         elapsed = time.monotonic() - self.started
@@ -230,18 +233,21 @@ async def run_session(args, stats: Stats, deadline: float | None) -> None:
                       flush=True)
                 if args.emit_tokens:
                     print(f"TOKEN {token}", flush=True)
-                if args.verifier and stats.verified < args.verify_count:
+                due = (time.monotonic() - stats.last_verify_at) >= args.verify_interval
+                if args.verifier and stats.verified < args.verify_count and due:
+                    stats.last_verify_at = time.monotonic()
                     stats.verified += 1
                     index = stats.verified
+                    at = time.monotonic() - stats.started
 
-                    async def check(tok=token, idx=index):
+                    async def check(tok=token, idx=index, when=at):
                         verdict = await loop.run_in_executor(
                             None, verify_token, args.verifier, tok,
                             args.verifier_proxy)
                         key = (verdict.split(":")[0] if verdict.startswith("ERROR")
                                else verdict)
                         stats.verdicts[key] = stats.verdicts.get(key, 0) + 1
-                        print(f"  VERIFY[{idx}] {verdict}", flush=True)
+                        print(f"  VERIFY[{idx}] t=+{when:.0f}s {verdict}", flush=True)
 
                     pending.append(asyncio.ensure_future(check()))
             elif text.startswith("E:"):
@@ -319,6 +325,13 @@ async def main() -> int:
     parser.add_argument("--ff-version", type=int, default=135)
     parser.add_argument("--verify-count", type=int, default=3,
                         help="replay this many minted tokens through a real join")
+    parser.add_argument("--verify-interval", type=float, default=0,
+                        help="minimum seconds between sampled tokens. 0 (the "
+                             "default) verifies the FIRST --verify-count tokens, "
+                             "which all land in the opening seconds of a run and "
+                             "therefore CANNOT detect a mid-run acceptance "
+                             "collapse — this pipeline's known silent failure "
+                             "mode. Set it to spread sampling over the run.")
     parser.add_argument("--verifier", default="",
                         help="path to the joinverify binary (empty = mint only)")
     parser.add_argument("--verifier-proxy", default="",

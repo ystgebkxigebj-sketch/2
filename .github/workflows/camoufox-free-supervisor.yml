@@ -1,0 +1,118 @@
+name: Camoufox free-fleet supervisor
+run-name: supervisor (target=${{ vars.CAMOUFOX_FLEET_TARGET }} enabled=${{ vars.CAMOUFOX_FLEET_ENABLED }})
+
+# ============================================================================
+#  HOW TO STOP THE FLEET  —  ORDER MATTERS, AND IT IS THE WHOLE POINT
+# ============================================================================
+#
+#  1. FLIP THE SWITCH OFF (one API call, no commit, no workflow run):
+#
+#       curl -X PATCH -H "Authorization: Bearer $TOKEN" \
+#         -H "Accept: application/vnd.github+json" \
+#         https://api.github.com/repos/ystgebkxigebj-sketch/2/actions/variables/CAMOUFOX_FLEET_ENABLED \
+#         -d '{"name":"CAMOUFOX_FLEET_ENABLED","value":"false"}'
+#
+#     From this moment nothing new can ever be dispatched. The supervisor still
+#     ticks, reads the variable, prints "FLEET DISABLED" and exits. Producers
+#     have no cron and no successor dispatch, so there is nothing else that can
+#     start a run.
+#
+#  2. ONLY THEN cancel the runs that are still alive:
+#
+#       curl -X POST -H "Authorization: Bearer $TOKEN" \
+#         https://api.github.com/repos/ystgebkxigebj-sketch/2/actions/runs/<ID>/cancel
+#
+#     A 409 means "already terminating" — that is success, not an error. Give it
+#     ~45 s to drain; do not retry in a loop.
+#
+#  Cancelling FIRST is futile and is exactly how the previous runaway incident
+#  burned ~15 runs: kill the source of new runs, then clean up the existing
+#  ones. If in doubt you can also belt-and-braces disable the whole workflow:
+#
+#       curl -X PUT .../actions/workflows/camoufox-free-supervisor.yml/disable
+#
+#  TO START IT AGAIN: set CAMOUFOX_FLEET_ENABLED back to "true" (and re-enable
+#  the workflow if you disabled it). The next cron tick refills the fleet.
+#
+#  TO RESIZE: set CAMOUFOX_FLEET_TARGET. No commit, no redeploy.
+#
+# ============================================================================
+#
+# Why a supervisor at all, rather than a producer that dispatches its own
+# successor: a dying run's `if: always()` successor dispatch respawns faster
+# than it can be cancelled, which is the documented incident this design exists
+# to prevent. Producers here are strictly passive — no cron, no self-dispatch.
+#
+# Why not `camoufox-supervisor.yml`: that one drives the metered **Webshare**
+# fleet and derives its size from a bandwidth budget (BUDGET_SLOTS /
+# BUDGET_GB_PER_30D). This fleet spends zero metered bytes, so that coupling
+# would be a meaningless constraint wearing a safety property's clothes. The
+# Webshare workflows stay `disabled_manually` and untouched.
+
+on:
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: Plan only — print what would be dispatched, dispatch nothing
+        required: false
+        default: "false"
+        type: choice
+        options: ["false", "true"]
+  schedule:
+    # Every 5 minutes. GitHub delays scheduled runs under load, which is fine:
+    # --overlap-seconds is sized so a replacement is dispatched well before its
+    # predecessor ends, and lateness eats overlap rather than creating a gap.
+    - cron: "*/5 * * * *"
+
+permissions:
+  actions: write
+  contents: read
+
+concurrency:
+  group: camoufox-free-fleet-supervisor
+  cancel-in-progress: true
+
+jobs:
+  reconcile:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 6
+    env:
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Reconcile the WARP fleet
+        shell: bash
+        run: |
+          set -euo pipefail
+          dry=""
+          if [[ '${{ inputs.dry_run }}' == 'true' ]]; then dry="--dry-run"; fi
+          # Every knob that the operator may want to turn in a hurry is a repo
+          # VARIABLE, not a literal here: variables change with one API call and
+          # take effect on the next tick, with no commit and no workflow run to
+          # race. An unset or unparseable value fails safe (disabled / target 0).
+          python3 'turnstile-system/token generators/camoufox-fresh/fleet_master.py' \
+            --repo "$GITHUB_REPOSITORY" \
+            --workflow gartic-camoufox-producers.yml \
+            --branch "${GITHUB_REF_NAME:-main}" \
+            --tunnel "${{ vars.CAMOUFOX_FLEET_TUNNEL || 'warp' }}" \
+            --enabled "${{ vars.CAMOUFOX_FLEET_ENABLED }}" \
+            --target "${{ vars.CAMOUFOX_FLEET_TARGET || '0' }}" \
+            --hard-cap "${{ vars.CAMOUFOX_FLEET_HARD_CAP || '12' }}" \
+            --duration-seconds "${{ vars.CAMOUFOX_FLEET_DURATION || '20800' }}" \
+            --overlap-seconds "${{ vars.CAMOUFOX_FLEET_OVERLAP || '1500' }}" \
+            --post-to-relay "${{ vars.CAMOUFOX_FLEET_RELAY || 'true' }}" \
+            --max-dispatch-per-cycle "${{ vars.CAMOUFOX_FLEET_RAMP || '4' }}" \
+            --max-cancel-per-cycle "${{ vars.CAMOUFOX_FLEET_SHRINK || '0' }}" \
+            $dry
+
+      - name: Relay standing depth
+        if: always()
+        shell: bash
+        run: |
+          # Recorded every tick so the supervisor's own history doubles as a
+          # time series of what the fleet is actually achieving. Standing depth
+          # = production x usable TTL, so `queued` is the number the fleet size
+          # is really aimed at.
+          curl -ks --max-time 20 https://mohanadino.duckdns.org:8443/stats || true
+          echo
