@@ -262,19 +262,24 @@ def main() -> int:
     parser.add_argument("--target", default="0",
                         help="producer jobs to keep alive (string so an unset "
                              "repo variable is a clean 0 rather than a crash)")
-    parser.add_argument("--hard-cap", type=int, default=6,
+    parser.add_argument("--hard-cap", type=int, default=16,
                         help="never let total alive producer jobs exceed this, "
                              "whatever --target says")
-    parser.add_argument("--runner-ceiling", type=int, default=9,
-                        help="the account's MEASURED concurrent-job ceiling. The "
-                             "supervisor competes with its own producers for "
-                             "that pool, so the cap is held below it: if "
-                             "producers ever fill every slot, this job cannot get "
-                             "a runner, and a 24/7 loop whose refill step can be "
-                             "crowded out by its own workers is not 24/7.")
-    parser.add_argument("--reserve-slots", type=int, default=3,
-                        help="runner slots kept free for this supervisor and for "
-                             "successors dispatched during an overlap window")
+    parser.add_argument("--runner-ceiling", type=int, default=20,
+                        help="the account's MEASURED simultaneous concurrent-job "
+                             "ceiling for producer-LENGTH jobs (~20 on a free "
+                             "public repo; a probe of trivial jobs undercounts "
+                             "it because they cycle through the runner-grant ramp "
+                             "before they can stack). The supervisor competes "
+                             "with its own producers for that pool, so the cap is "
+                             "held below it: if producers fill every slot, this "
+                             "job cannot get a runner, and a 24/7 loop whose "
+                             "refill step is crowded out by its workers is not "
+                             "24/7.")
+    parser.add_argument("--reserve-slots", type=int, default=2,
+                        help="runner slots kept free for this supervisor's own "
+                             "reconcile job, each producer run's short plan job, "
+                             "and successors dispatched during an overlap window")
     parser.add_argument("--duration-seconds", type=int, default=20800,
                         help="what each producer is dispatched with (GitHub caps "
                              "a job at 6 h; 20800 s = 5.78 h)")

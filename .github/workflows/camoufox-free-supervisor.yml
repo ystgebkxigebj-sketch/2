@@ -99,6 +99,8 @@ jobs:
             --enabled "${{ vars.CAMOUFOX_FLEET_ENABLED }}" \
             --target "${{ vars.CAMOUFOX_FLEET_TARGET || '0' }}" \
             --hard-cap "${{ vars.CAMOUFOX_FLEET_HARD_CAP || '12' }}" \
+            --runner-ceiling "${{ vars.CAMOUFOX_FLEET_CEILING || '20' }}" \
+            --reserve-slots "${{ vars.CAMOUFOX_FLEET_RESERVE || '2' }}" \
             --duration-seconds "${{ vars.CAMOUFOX_FLEET_DURATION || '20800' }}" \
             --overlap-seconds "${{ vars.CAMOUFOX_FLEET_OVERLAP || '1500' }}" \
             --post-to-relay "${{ vars.CAMOUFOX_FLEET_RELAY || 'true' }}" \
