@@ -1,0 +1,13 @@
+# Camoufox pulls in playwright and browserforge itself.
+# Tested against camoufox 0.4.11 with playwright 1.61.0.
+#
+# playwright >= 1.61 sends an `isMobile` field in Browser.setDefaultViewport
+# that the Camoufox v135 Juggler protocol rejects, so generator.py creates its
+# context with no_viewport=True. Do not remove that argument unless you have
+# also pinned an older playwright.
+camoufox[geoip]==0.4.11
+
+# NOTE: the browser itself is NOT installed by `camoufox fetch`, which pulls
+# v152 — a version that yields zero tokens on gartic's sitekey (Cloudflare
+# error 600010, measured 70x with 0 tokens). Use the v135.0.1-beta.24 build and
+# point --executable at it. See README.md.

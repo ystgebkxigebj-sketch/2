@@ -1,0 +1,151 @@
+name: Gartic Camoufox Fresh
+run-name: Camoufox fresh (proxy=${{ inputs.use_proxy }})
+
+# Experimental producer built from scratch on 2026-07-24 and proven LOCALLY on a
+# residential connection: ~44 tokens/min, zero Cloudflare errors, and 8/8 of the
+# minted tokens returned VERDICT: JOINED through cmd/joindebug — with NO proxy.
+#
+# This workflow asks the one question that local testing cannot answer: does that
+# same configuration work from a GitHub-hosted runner?
+#
+# Prior evidence says proxyless will FAIL here: the pinned producer, same v135
+# browser, direct from a runner, produced 13x `600010` and zero tokens. Cloudflare
+# refuses to serve the challenge to GitHub's IP ranges. That test used
+# humanize=False and long browser lifetimes, so use_proxy=false re-tests it with
+# this config's humanize=True + 5-minute reputation-wiping restarts. If it still
+# 600010s, the runner IP is conclusively the blocker and GitHub always needs a
+# proxy.
+
+on:
+  workflow_dispatch:
+    inputs:
+      duration:
+        description: Seconds to run
+        required: true
+        default: "600"
+      token_interval:
+        description: Seconds to wait after each token (0 = unthrottled)
+        required: true
+        default: "0"
+      use_proxy:
+        description: Route the browser through a CAMOUFOX_PROXIES exit
+        required: true
+        default: "true"
+        type: choice
+        options: ["true", "false"]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: camoufox-fresh
+  cancel-in-progress: false
+
+jobs:
+  generate:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    env:
+      PYTHONUNBUFFERED: "1"
+      AUTH_SECRET: ${{ secrets.CAMOUFOX_AUTH_SECRET }}
+      CAMOUFOX_PROXIES: ${{ secrets.CAMOUFOX_PROXIES }}
+      RELAY_URL: ${{ vars.CAMOUFOX_RELAY_URL || 'https://mohanadino.duckdns.org:8443/add' }}
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Select and mask a proxy
+        if: inputs.use_proxy != 'false'
+        shell: bash
+        run: |
+          set -euo pipefail
+          mapfile -t proxies < <(printf '%s\n' "$CAMOUFOX_PROXIES" | sed '/^[[:space:]]*$/d')
+          if (( ${#proxies[@]} == 0 )); then echo "CAMOUFOX_PROXIES is empty" >&2; exit 1; fi
+          index=$(( GITHUB_RUN_NUMBER % ${#proxies[@]} ))
+          selected="${proxies[$index]}"
+          echo "::add-mask::$selected"
+          echo "PROXY=$selected" >> "$GITHUB_ENV"
+          echo "proxy_count=${#proxies[@]} index=$index"
+
+      - name: Install Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install Firefox runtime libraries
+        shell: bash
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends \
+            libasound2t64 libdbus-glib-1-2 libgbm1 libgtk-3-0 libnss3 \
+            libx11-xcb1 libxcomposite1 libxcursor1 libxdamage1 libxfixes3 \
+            libxi6 libxrandr2 libxrender1 libxss1 libxt6 libxtst6 \
+            fonts-liberation unzip
+
+      - name: Cache Camoufox v135 browser
+        id: browser-cache
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/camoufox
+          key: camoufox-135.0.1-beta.24-lin-x86_64-61e1ec455e021720
+
+      # `camoufox fetch` installs v152, which yields ZERO tokens on this sitekey
+      # (measured: 70x error 600010). The exact v135 build must be placed by hand.
+      - name: Install Camoufox 135.0.1-beta.24
+        if: steps.browser-cache.outputs.cache-hit != 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
+          url='https://github.com/daijro/camoufox/releases/download/v135.0.1-beta.24/camoufox-135.0.1-beta.24-lin.x86_64.zip'
+          expected='61e1ec455e021720af38a5cc5ff7566121363cb5b82b72f24e381ba2676a4888'
+          curl -fL --retry 3 -o /tmp/camoufox.zip "$url"
+          echo "$expected  /tmp/camoufox.zip" | sha256sum --check --strict
+          rm -rf "$HOME/.cache/camoufox"; mkdir -p "$HOME/.cache/camoufox"
+          unzip -q /tmp/camoufox.zip -d "$HOME/.cache/camoufox"
+          printf '%s\n' '{"version":"135.0.1","release":"beta.24"}' > "$HOME/.cache/camoufox/version.json"
+          chmod -R u+rwX,go+rX "$HOME/.cache/camoufox"
+
+      - name: Install pinned Python packages
+        shell: bash
+        run: |
+          set -euo pipefail
+          python -m pip install --disable-pip-version-check \
+            'camoufox[geoip]==0.4.11' 'playwright==1.61.0'
+          python -c 'import camoufox, geoip2, playwright; print("imports=ok")'
+          "$HOME/.cache/camoufox/camoufox-bin" --version
+
+      - name: Run the fresh generator
+        id: generator
+        continue-on-error: true
+        shell: bash
+        run: |
+          set -uo pipefail
+          python -u 'turnstile-system/token generators/camoufox-fresh/generator.py' \
+            --out /tmp/tokens.jsonl \
+            --label "gh-proxy-${{ inputs.use_proxy }}" \
+            --duration '${{ inputs.duration }}' \
+            --token-interval '${{ inputs.token_interval }}' \
+            --browser-lifetime 300 \
+            --reload-interval 120 \
+            --humanize \
+            --executable "$HOME/.cache/camoufox/camoufox-bin" \
+            --ff-version 135 \
+            --relay-url "$RELAY_URL"
+
+      - name: Report outcome
+        if: always()
+        shell: bash
+        run: |
+          tokens=$(wc -l < /tmp/tokens.jsonl 2>/dev/null || echo 0)
+          echo "=========================================="
+          echo " use_proxy = ${{ inputs.use_proxy }}"
+          echo " tokens produced = $tokens"
+          echo "=========================================="
+          if [[ "$tokens" -eq 0 ]]; then
+            echo "ZERO tokens. If the log shows 600010, Cloudflare refused to serve"
+            echo "the challenge to this runner IP — the known GitHub-proxyless wall."
+            exit 1
+          fi
+          echo "Tokens were POSTed to the relay; verify they JOIN with:"
+          echo "  go run ./cmd/joindebug -lang 19 -platform 0 -tokenval <TOKEN> -nick probe"
