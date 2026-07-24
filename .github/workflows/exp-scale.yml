@@ -1,0 +1,249 @@
+name: EXP scale
+
+# EXPERIMENT — dispatch-only, no cron, no successor dispatch, no Webshare.
+#
+# Question: does token production scale **horizontally** across runners?
+#
+# Established: one WARP producer sustains 49.3 tok/min for 20 min (986 tokens,
+# 1 Cloudflare error, no decay), and one VPN Gate producer does 19.7 tok/min on
+# a Japanese residential exit. Both verified by real joins. But two concurrent
+# WARP runs drew the SAME exit and the second produced nothing except Cloudflare
+# 300030 — because solve-rate is capped per exit IP, not per machine.
+#
+# So the only number that matters here is **aggregate** rate across N runners,
+# and the thing to watch is whether the N exits are distinct. Every job prints
+# its exit IP so collisions are visible rather than inferred.
+#
+# VPN Gate is expected to scale better by construction: --index/--stride hand
+# each producer a disjoint slice of the ranked relay list, so N runners take N
+# different relays instead of all racing for the fastest one.
+
+on:
+  workflow_dispatch:
+    inputs:
+      tunnel:
+        description: Egress tunnel
+        required: true
+        default: vpngate
+        type: choice
+        options: [warp, vpngate]
+      fanout:
+        description: Concurrent producers
+        required: true
+        default: "3"
+        type: choice
+        options: ["1", "2", "3", "4", "5", "6"]
+      warp_strategy:
+        description: WARP only — how to vary the WireGuard endpoint per job
+        required: true
+        default: endpoint-ip
+        type: choice
+        options: [default, endpoint-ip, endpoint-port, endpoint-both]
+      duration:
+        description: Seconds to mint for
+        required: true
+        default: "300"
+      verify_count:
+        description: Tokens per job to replay through a real join
+        required: true
+        default: "3"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: exp-scale-${{ inputs.tunnel }}
+  cancel-in-progress: false
+
+jobs:
+  plan:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 2
+    outputs:
+      matrix: ${{ steps.pick.outputs.matrix }}
+    steps:
+      - id: pick
+        shell: bash
+        run: |
+          set -euo pipefail
+          m=$(python3 -c "print(__import__('json').dumps(list(range(1, ${{ inputs.fanout }}+1))))")
+          echo "matrix=$m" >> "$GITHUB_OUTPUT"
+          echo "matrix=$m"
+
+  produce:
+    needs: plan
+    strategy:
+      fail-fast: false
+      max-parallel: 6
+      matrix:
+        idx: ${{ fromJSON(needs.plan.outputs.matrix) }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 40
+    env:
+      PYTHONUNBUFFERED: "1"
+      FANOUT: ${{ inputs.fanout }}
+      IDX: ${{ matrix.idx }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install Firefox runtime libraries
+        shell: bash
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends \
+            libasound2t64 libdbus-glib-1-2 libgbm1 libgtk-3-0 libnss3 \
+            libx11-xcb1 libxcomposite1 libxcursor1 libxdamage1 libxfixes3 \
+            libxi6 libxrandr2 libxrender1 libxss1 libxt6 libxtst6 \
+            fonts-liberation unzip
+
+      - name: Cache Camoufox v135 browser
+        id: browser-cache
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/camoufox
+          key: camoufox-135.0.1-beta.24-lin-x86_64-61e1ec455e021720
+
+      # `camoufox fetch` installs v152, which yields ZERO tokens on this sitekey.
+      - name: Install Camoufox 135.0.1-beta.24
+        if: steps.browser-cache.outputs.cache-hit != 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
+          url='https://github.com/daijro/camoufox/releases/download/v135.0.1-beta.24/camoufox-135.0.1-beta.24-lin.x86_64.zip'
+          expected='61e1ec455e021720af38a5cc5ff7566121363cb5b82b72f24e381ba2676a4888'
+          ok=""
+          for attempt in 1 2 3 4 5 6; do
+            if curl -fL --retry 3 --retry-delay 3 --retry-all-errors -C - \
+                 --connect-timeout 20 -o /tmp/camoufox.zip "$url"; then
+              if echo "$expected  /tmp/camoufox.zip" | sha256sum --check --strict; then ok=1; break; fi
+            fi
+            echo "attempt $attempt failed; backing off"; sleep $(( attempt * 10 ))
+          done
+          if [[ -z "$ok" ]]; then echo "could not download camoufox" >&2; exit 1; fi
+          rm -rf "$HOME/.cache/camoufox"; mkdir -p "$HOME/.cache/camoufox"
+          unzip -q /tmp/camoufox.zip -d "$HOME/.cache/camoufox"
+          printf '%s\n' '{"version":"135.0.1","release":"beta.24"}' > "$HOME/.cache/camoufox/version.json"
+          chmod -R u+rwX,go+rX "$HOME/.cache/camoufox"
+
+      - name: Install pinned Python packages
+        shell: bash
+        run: |
+          set -euo pipefail
+          python -m pip install --disable-pip-version-check \
+            'camoufox[geoip]==0.4.11' 'playwright==1.61.0'
+          python -c 'import camoufox, geoip2, playwright; print("imports=ok")'
+
+      - name: Install Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: "stable"
+          cache: false
+
+      - name: Build the join verifier
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd experiments/egress/joinverify
+          go build -o "$RUNNER_TEMP/joinverify" .
+          echo "JOINVERIFY=$RUNNER_TEMP/joinverify" >> "$GITHUB_ENV"
+
+      - name: Bring up WARP
+        if: inputs.tunnel == 'warp'
+        shell: bash
+        run: |
+          set -euo pipefail
+          HOSTS=(162.159.192.1 162.159.193.10 162.159.195.1 188.114.96.1 \
+                 188.114.97.1 188.114.98.1 188.114.99.1 162.159.204.1)
+          PORTS=(2408 500 1701 4500 8854 894 943 3138)
+          i=$(( IDX - 1 ))
+          host=""; port=""
+          case '${{ inputs.warp_strategy }}' in
+            endpoint-ip)   host="${HOSTS[$(( i % ${#HOSTS[@]} ))]}" ;;
+            endpoint-port) host="engage.cloudflareclient.com"; port="${PORTS[$(( i % ${#PORTS[@]} ))]}" ;;
+            endpoint-both) host="${HOSTS[$(( i % ${#HOSTS[@]} ))]}"; port="${PORTS[$(( i % ${#PORTS[@]} ))]}" ;;
+            default)       : ;;
+          esac
+          chmod +x experiments/egress/warp_up.sh
+          experiments/egress/warp_up.sh 25344 "$host" "$port" | tee /tmp/warp.txt | sed 's/^/WARP_/'
+          echo "PROXY=socks5://127.0.0.1:25344" >> "$GITHUB_ENV"
+          echo "EXITIP=$(sed -n 's/^exit_ip=//p' /tmp/warp.txt)" >> "$GITHUB_ENV"
+
+      - name: Bring up VPN Gate (relay slice ${{ matrix.idx }}/${{ inputs.fanout }})
+        if: inputs.tunnel == 'vpngate'
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo apt-get install -y --no-install-recommends openvpn
+          curl -fsSL --retry 3 -o vpngate.csv https://www.vpngate.net/api/iphone/
+          # Disjoint slice per job: without this every runner ranks the feed the
+          # same way, picks the same relay, and they collide on one exit IP.
+          python3 experiments/egress/vpngate.py vpngate.csv /tmp/vpn \
+            --count 6 --index "$IDX" --stride "$FANOUT"
+          before=$(curl -4 -s --max-time 10 https://api.ipify.org)
+          echo "egress_before=$before"
+          ok=""; tried=0
+          for cfg in /tmp/vpn/*.ovpn; do
+            tried=$(( tried + 1 ))
+            echo "--- trying $(basename "$cfg") ---"
+            sudo openvpn --config "$cfg" --daemon --log /tmp/ovpn.log \
+              --connect-timeout 15 --connect-retry-max 1 || continue
+            for _ in $(seq 1 15); do
+              now=$(curl -4 -s --max-time 5 https://api.ipify.org || true)
+              if [[ -n "$now" && "$now" != "$before" ]]; then ok="$now"; break; fi
+              sleep 2
+            done
+            [[ -n "$ok" ]] && break
+            sudo pkill openvpn || true; sleep 2
+          done
+          echo "relays_tried=$tried"
+          if [[ -z "$ok" ]]; then
+            echo "no VPN Gate relay in this slice came up" >&2
+            tail -20 /tmp/ovpn.log >&2 || true; exit 1
+          fi
+          echo "vpn_egress=$ok"
+          curl -s --max-time 15 "https://ipinfo.io/${ok}/json" | tr -d '\n'; echo
+          # OpenVPN takes the default route rather than setting a proxy.
+          echo "PROXY=" >> "$GITHUB_ENV"
+          echo "EXITIP=$ok" >> "$GITHUB_ENV"
+
+      - name: Mint and verify
+        continue-on-error: true
+        shell: bash
+        run: |
+          set -uo pipefail
+          extra=""
+          # A default-route tunnel has no PROXY to key geoip off, but its exit is
+          # just as foreign to the runner's UTC clock — a 600010 trigger by itself.
+          if [[ '${{ inputs.tunnel }}' == 'vpngate' ]]; then extra="--geoip"; fi
+          # Verify over the tunnel: gartic's WAF 403s the discovery endpoint from
+          # some runner addresses, which would be misread as a rejected token.
+          if [[ -n "${PROXY:-}" ]]; then extra="$extra --verifier-proxy $PROXY"; fi
+          python -u experiments/egress/probe.py \
+            --label "${{ inputs.tunnel }}/${{ matrix.idx }}-of-${{ inputs.fanout }}" \
+            --duration '${{ inputs.duration }}' \
+            --verify-count '${{ inputs.verify_count }}' \
+            --verifier "$JOINVERIFY" \
+            --result-file "$RUNNER_TEMP/result.json" \
+            --executable "$HOME/.cache/camoufox/camoufox-bin" \
+            --ff-version 135 \
+            $extra
+
+      - name: Verdict
+        if: always()
+        shell: bash
+        run: |
+          echo "===== ${{ inputs.tunnel }} job ${{ matrix.idx }}/${{ inputs.fanout }} exit=${EXITIP:-unknown} ====="
+          if [[ -f "$RUNNER_TEMP/result.json" ]]; then
+            python3 -c "
+import json,os
+r=json.load(open(os.environ['RUNNER_TEMP']+'/result.json'))
+r['exit_ip']=os.environ.get('EXITIP','unknown')
+print('SCALE '+json.dumps(r,sort_keys=True))"
+          else
+            echo 'SCALE {"error":"no result file","exit_ip":"'"${EXITIP:-unknown}"'"}'
+          fi
