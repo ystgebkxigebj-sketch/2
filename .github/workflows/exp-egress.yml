@@ -102,6 +102,13 @@ jobs:
           echo "egress_v6=${v6:-NONE}"
           echo "--- asn/org ---"
           curl -s --max-time 15 "https://ipinfo.io/${v4}/json" | tr -d '\n'; echo
+          # Authoritative: this is the address Cloudflare itself attributes the
+          # request to, which is the only one that matters for a challenge
+          # decision. On a dual-stack runner it also reveals whether Happy
+          # Eyeballs is already egressing over IPv6 to Cloudflare-hosted hosts.
+          echo "--- cloudflare's view of us ---"
+          curl -s --max-time 15 https://www.cloudflare.com/cdn-cgi/trace \
+            | grep -E '^(ip|loc|warp|colo)=' | sed 's/^/cf_/'
           echo "--- turnstile api.js reachability ---"
           curl -s -o /dev/null -w 'api.js http=%{http_code} time=%{time_total}s\n' \
             --max-time 20 https://challenges.cloudflare.com/turnstile/v0/api.js
