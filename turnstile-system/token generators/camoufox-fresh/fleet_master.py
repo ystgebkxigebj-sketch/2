@@ -148,11 +148,20 @@ def plan_cycle(runs: list[Run], *, target: int, hard_cap: int,
     predicts the end EARLIER than it really happens. That error is deliberately
     in the safe direction: the successor is dispatched a little early and the two
     overlap, rather than a little late leaving a hole.
+
+    The window is clamped to a third of the run's own duration. Without that,
+    an `overlap >= duration` misconfiguration makes EVERY run permanently
+    "retiring" — none ever counts toward the target, so the supervisor dispatches
+    replacements every single cycle until it hits the hard cap, and the fleet
+    churns instead of producing. That exact pair (duration 900, overlap 1500)
+    was live in the repo variables for a while, so the guard belongs in the code
+    rather than in a comment telling operators not to do it.
     """
     plan = Plan()
     for run in runs:
         remaining = run.duration - run.age if run.duration else float("inf")
-        (plan.retiring if remaining <= overlap_seconds else plan.productive).append(run)
+        window = min(overlap_seconds, run.duration / 3.0) if run.duration else overlap_seconds
+        (plan.retiring if remaining <= window else plan.productive).append(run)
 
     held = sum(r.slots for r in plan.productive)
     alive = sum(r.slots for r in runs)
@@ -253,10 +262,19 @@ def main() -> int:
     parser.add_argument("--target", default="0",
                         help="producer jobs to keep alive (string so an unset "
                              "repo variable is a clean 0 rather than a crash)")
-    parser.add_argument("--hard-cap", type=int, default=16,
+    parser.add_argument("--hard-cap", type=int, default=6,
                         help="never let total alive producer jobs exceed this, "
-                             "whatever --target says. The account's concurrency "
-                             "ceiling is shared with this supervisor's own job.")
+                             "whatever --target says")
+    parser.add_argument("--runner-ceiling", type=int, default=9,
+                        help="the account's MEASURED concurrent-job ceiling. The "
+                             "supervisor competes with its own producers for "
+                             "that pool, so the cap is held below it: if "
+                             "producers ever fill every slot, this job cannot get "
+                             "a runner, and a 24/7 loop whose refill step can be "
+                             "crowded out by its own workers is not 24/7.")
+    parser.add_argument("--reserve-slots", type=int, default=3,
+                        help="runner slots kept free for this supervisor and for "
+                             "successors dispatched during an overlap window")
     parser.add_argument("--duration-seconds", type=int, default=20800,
                         help="what each producer is dispatched with (GitHub caps "
                              "a job at 6 h; 20800 s = 5.78 h)")
@@ -287,9 +305,23 @@ def main() -> int:
         target = 0
     if target < 0:
         target = 0
-    if target > args.hard_cap:
-        print(f"target {target} exceeds hard cap {args.hard_cap} — clamped", flush=True)
-        target = args.hard_cap
+
+    # Runner headroom. This supervisor draws from the same hosted-runner pool as
+    # the producers it starts, so the cap must leave slots free — measured the
+    # hard way: right after a 56-job burst, a single-job supervisor run sat
+    # queued for 37 minutes and never got a runner. Had that been a real refill
+    # cycle with the fleet at full width, nothing would have replaced the
+    # producers as they aged out.
+    ceiling = max(1, args.runner_ceiling - args.reserve_slots)
+    hard_cap = args.hard_cap
+    if hard_cap > ceiling:
+        print(f"hard cap {hard_cap} would leave fewer than {args.reserve_slots} "
+              f"runner slots free of a {args.runner_ceiling}-job ceiling — "
+              f"clamped to {ceiling}", flush=True)
+        hard_cap = ceiling
+    if target > hard_cap:
+        print(f"target {target} exceeds hard cap {hard_cap} — clamped", flush=True)
+        target = hard_cap
 
     token = os.environ.get("GH_TOKEN", "").strip()
     if not token:
@@ -302,7 +334,7 @@ def main() -> int:
     plan = plan_cycle(
         runs,
         target=target,
-        hard_cap=args.hard_cap,
+        hard_cap=hard_cap,
         overlap_seconds=args.overlap_seconds,
         max_dispatch=args.max_dispatch_per_cycle,
         max_cancel=args.max_cancel_per_cycle,
@@ -312,7 +344,8 @@ def main() -> int:
     running = sum(r.slots for r in runs if r.status == "in_progress")
     foreign = [r for r in runs if not r.ours]
     print(
-        f"tunnel={args.tunnel} target={target} hard_cap={args.hard_cap} "
+        f"tunnel={args.tunnel} target={target} hard_cap={hard_cap} "
+        f"ceiling={args.runner_ceiling}(reserve {args.reserve_slots}) "
         f"alive={sum(r.slots for r in runs)} (running={running} queued={queued}) "
         f"productive={sum(r.slots for r in plan.productive)} "
         f"retiring={sum(r.slots for r in plan.retiring)} "
