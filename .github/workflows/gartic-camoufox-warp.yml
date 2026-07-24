@@ -180,8 +180,6 @@ jobs:
             https://www.cloudflare.com/cdn-cgi/trace | grep -E '^(ip|warp|loc)=' | sed 's/^/warp_/'
           echo "PROXY=socks5://127.0.0.1:25344" >> "$GITHUB_ENV"
           # A working verifier must answer REJECTED code=5 for a bogus token;
-          # anything else means the preflight below would be measuring itself.
-          # A working verifier must answer REJECTED code=5 for a bogus token;
           # anything else means the preflight below is measuring itself.
           "$JOINVERIFY" -proxy socks5://127.0.0.1:25344 '1.AAAAAAAAAAAA.BBBBBBBB' \
             | sed 's/^/selftest over tunnel (invalid token): /'
