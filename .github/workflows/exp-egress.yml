@@ -205,13 +205,13 @@ jobs:
           python -c 'import camoufox, geoip2, playwright; print("imports=ok")'
 
       # Not preinstalled on the macOS arm64 image, so it cannot be assumed.
-      # 1.24, not 1.22: binaries linked by Go 1.22 on darwin/arm64 lack an
+      # Must be >= 1.24: binaries linked by Go 1.22 on darwin/arm64 lack an
       # LC_UUID load command and current dyld aborts them outright
       # (`Abort trap: 6` before main runs).
       - name: Install Go
         uses: actions/setup-go@v5
         with:
-          go-version: "1.24"
+          go-version: "stable"
           cache: false
 
       # The join replay has to be a separate Go binary: Python's TLS fingerprint
@@ -342,6 +342,10 @@ jobs:
           # has to be asked for explicitly or the fingerprint keeps the runner's
           # UTC timezone against a JP exit — a 600010 trigger on its own.
           if [[ '${{ inputs.tunnel }}' == 'vpngate' ]]; then extra="$extra --geoip"; fi
+          # Verify over the same tunnel the token was minted on. gartic's WAF
+          # 403s the server-discovery endpoint from some runner addresses, and
+          # that failure would otherwise be misread as a bad token.
+          if [[ -n "${PROXY:-}" ]]; then extra="$extra --verifier-proxy $PROXY"; fi
           python -u experiments/egress/probe.py \
             --label '${{ matrix.os }}/${{ inputs.tunnel }}' \
             --duration '${{ inputs.duration }}' \

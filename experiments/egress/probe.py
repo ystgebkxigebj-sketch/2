@@ -18,17 +18,21 @@ verification is unreliable. Instead every minted token is replayed *here*,
 immediately, through gartic's real join handshake (the same protocol
 ``cmd/joindebug`` speaks). The verdict is printed inline.
 
-The replay runs **inside the Camoufox page**, not from Python. A Python
-``websocket-client`` handshake to ``serverNN.gartic.io`` is answered with
-Cloudflare **403** even from an IP where Go's ``cmd/joindebug`` gets a clean
-101 — the TLS fingerprint alone is enough to be refused. Driving the socket
-from the browser sidesteps that entirely and is the more faithful test anyway:
-real browser TLS, real gartic.io origin, real cookie jar.
+The replay is delegated to the ``joinverify`` Go binary, because both in-process
+options fail for reasons unrelated to the token: a Python ``websocket-client``
+handshake to ``serverNN.gartic.io`` is answered with Cloudflare **403** on TLS
+fingerprint alone (from the very IP where Go gets a clean 101), and opening the
+socket from inside the Camoufox page tears down v135's Juggler connection.
 
-Caveat that must be kept in mind when reading a negative: the join originates
-from this machine's IP too, so a ``REJECTED`` result cannot by itself separate
-"bad token" from "join IP refused". A ``JOINED`` result is unambiguous.
-Use --emit-tokens to re-verify from a trusted IP when that distinction matters.
+Pass ``--verifier-proxy`` to send the check through the same tunnel the token
+was minted over. That is not cosmetic: gartic's WAF serves a 403 block page to
+the server-discovery endpoint from some GitHub runner addresses, which would
+otherwise be misread as a rejected token.
+
+Caveat when reading a negative: the join is made from wherever the verifier
+egresses, so a ``REJECTED`` cannot by itself separate "bad token" from "join IP
+refused". A ``JOINED`` is unambiguous. Use --emit-tokens to re-verify from a
+trusted IP when that distinction matters.
 """
 
 from __future__ import annotations
@@ -87,7 +91,7 @@ RENDERER_JS = r"""
 # join verification — the only measurement that counts
 # --------------------------------------------------------------------------
 
-def verify_token(verifier: str, token: str) -> str:
+def verify_token(verifier: str, token: str, via_proxy: str = "") -> str:
     """Replay one token through gartic's join handshake via the Go helper.
 
     Returns "JOINED", "REJECTED code=N", "TIMEOUT" or "ERROR:...". The work is
@@ -97,9 +101,15 @@ def verify_token(verifier: str, token: str) -> str:
     alone, and opening the socket from inside the Camoufox page tears down
     v135's Juggler connection.
     """
+    command = [verifier]
+    if via_proxy:
+        # gartic's WAF answers the server-discovery endpoint with a 403 block
+        # page from some runner addresses. Checking over the same tunnel the
+        # token was minted on removes that from the measurement.
+        command += ["-proxy", via_proxy]
     try:
         completed = subprocess.run(
-            [verifier, token], capture_output=True, text=True, timeout=60,
+            command + [token], capture_output=True, text=True, timeout=60,
         )
     except subprocess.TimeoutExpired:
         return "ERROR:verifier-timeout"
@@ -226,7 +236,8 @@ async def run_session(args, stats: Stats, deadline: float | None) -> None:
 
                     async def check(tok=token, idx=index):
                         verdict = await loop.run_in_executor(
-                            None, verify_token, args.verifier, tok)
+                            None, verify_token, args.verifier, tok,
+                            args.verifier_proxy)
                         key = (verdict.split(":")[0] if verdict.startswith("ERROR")
                                else verdict)
                         stats.verdicts[key] = stats.verdicts.get(key, 0) + 1
@@ -310,6 +321,8 @@ async def main() -> int:
                         help="replay this many minted tokens through a real join")
     parser.add_argument("--verifier", default="",
                         help="path to the joinverify binary (empty = mint only)")
+    parser.add_argument("--verifier-proxy", default="",
+                        help="socks5://host:port to send join checks through")
     parser.add_argument("--result-file", default="",
                         help="also write the RESULT json here, so a lost stdout "
                              "tail cannot destroy the measurement")

@@ -12,29 +12,71 @@
 // connection. Go's TLS passes and costs nothing extra — it is preinstalled on
 // every GitHub-hosted runner.
 //
-// Usage: joinverify <token>
+// Usage: joinverify [-proxy socks5://host:port] <token>
 // Prints exactly one line: JOINED | REJECTED code=N | ERROR:<reason> | TIMEOUT
+//
+// -proxy matters more than it looks: gartic's Cloudflare WAF answers the
+// server-discovery endpoint with a 403 block page from some GitHub runner
+// addresses, so verifying over the runner's own egress fails for reasons that
+// have nothing to do with the token. Sending the check through the same tunnel
+// the token was minted over removes that variable.
 package main
 
 import (
+	"context"
 	"crypto/tls"
 	"encoding/json"
+	"flag"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
-	"os"
+	"net/url"
 	"strings"
 	"time"
 
 	"github.com/gorilla/websocket"
+	"golang.org/x/net/proxy"
 )
+
+// dialerFor returns a net dial function honouring an optional socks5:// or
+// http:// proxy URL. An empty spec means dial directly.
+func dialerFor(spec string) (func(ctx context.Context, network, addr string) (net.Conn, error), error) {
+	if spec == "" {
+		base := &net.Dialer{Timeout: 15 * time.Second}
+		return base.DialContext, nil
+	}
+	parsed, err := url.Parse(spec)
+	if err != nil {
+		return nil, err
+	}
+	var auth *proxy.Auth
+	if parsed.User != nil {
+		password, _ := parsed.User.Password()
+		auth = &proxy.Auth{User: parsed.User.Username(), Password: password}
+	}
+	socks, err := proxy.SOCKS5("tcp", parsed.Host, auth, &net.Dialer{Timeout: 15 * time.Second})
+	if err != nil {
+		return nil, err
+	}
+	return func(ctx context.Context, network, addr string) (net.Conn, error) {
+		return socks.Dial(network, addr)
+	}, nil
+}
 
 const userAgent = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 " +
 	"(KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
 
-func run(token string) string {
-	transport := &http.Transport{TLSClientConfig: &tls.Config{InsecureSkipVerify: true}}
-	client := &http.Client{Timeout: 15 * time.Second, Transport: transport}
+func run(token, proxySpec string) string {
+	dial, err := dialerFor(proxySpec)
+	if err != nil {
+		return "ERROR:proxy:" + err.Error()
+	}
+	transport := &http.Transport{
+		TLSClientConfig: &tls.Config{InsecureSkipVerify: true},
+		DialContext:     dial,
+	}
+	client := &http.Client{Timeout: 20 * time.Second, Transport: transport}
 
 	request, _ := http.NewRequest("GET", "https://gartic.io/server/?check=1&v3=1&lang=19", nil)
 	request.Header.Set("User-Agent", userAgent)
@@ -83,7 +125,8 @@ func run(token string) string {
 
 	dialer := websocket.Dialer{
 		TLSClientConfig:  &tls.Config{InsecureSkipVerify: true},
-		HandshakeTimeout: 10 * time.Second,
+		HandshakeTimeout: 15 * time.Second,
+		NetDialContext:   dial,
 	}
 	socket, dialResponse, err := dialer.Dial(url, header)
 	if err != nil {
@@ -144,9 +187,11 @@ func run(token string) string {
 }
 
 func main() {
-	if len(os.Args) < 2 {
+	proxySpec := flag.String("proxy", "", "socks5://host:port to send the check through (default: direct)")
+	flag.Parse()
+	if flag.NArg() < 1 {
 		fmt.Println("ERROR:no-token-argument")
 		return
 	}
-	fmt.Println(run(os.Args[1]))
+	fmt.Println(run(flag.Arg(0), *proxySpec))
 }

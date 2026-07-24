@@ -120,7 +120,7 @@ jobs:
       - name: Install Go
         uses: actions/setup-go@v5
         with:
-          go-version: "1.24"
+          go-version: "stable"
           cache: false
 
       - name: Build the join verifier
@@ -130,8 +130,10 @@ jobs:
           cd experiments/egress/joinverify
           go build -o "$RUNNER_TEMP/joinverify" .
           echo "JOINVERIFY=$RUNNER_TEMP/joinverify" >> "$GITHUB_ENV"
-          "$RUNNER_TEMP/joinverify" '1.AAAAAAAAAAAAAAAAAAAA.BBBBBBBBBBBBBBBB' \
-            | sed 's/^/selftest(invalid-token, expect REJECTED code=5): /'
+          # The selftest is deliberately deferred until the tunnel is up: gartic's
+          # WAF serves a 403 block page to the discovery endpoint from some runner
+          # addresses, so a direct check here fails for reasons that have nothing
+          # to do with the verifier.
 
       # This step MUST fail the run if the tunnel does not come up. Falling
       # through to direct egress would produce nothing but 600010 for hours.
@@ -177,6 +179,12 @@ jobs:
           curl -s --max-time 15 --socks5-hostname 127.0.0.1:25344 \
             https://www.cloudflare.com/cdn-cgi/trace | grep -E '^(ip|warp|loc)=' | sed 's/^/warp_/'
           echo "PROXY=socks5://127.0.0.1:25344" >> "$GITHUB_ENV"
+          # A working verifier must answer REJECTED code=5 for a bogus token;
+          # anything else means the preflight below would be measuring itself.
+          # A working verifier must answer REJECTED code=5 for a bogus token;
+          # anything else means the preflight below is measuring itself.
+          "$JOINVERIFY" -proxy socks5://127.0.0.1:25344 '1.AAAAAAAAAAAA.BBBBBBBB' \
+            | sed 's/^/selftest over tunnel (invalid token): /'
 
       # Prove this exit actually produces ACCEPTED tokens before streaming
       # anything to the relay. Cloudflare will happily issue tokens that gartic
@@ -188,6 +196,7 @@ jobs:
           python -u experiments/egress/probe.py \
             --label preflight --duration 120 --max-tokens 2 \
             --verify-count 1 --verifier "$JOINVERIFY" \
+            --verifier-proxy "$PROXY" \
             --result-file "$RUNNER_TEMP/preflight.json" \
             --executable "$HOME/.cache/camoufox/camoufox-bin" --ff-version 135
           python - "$RUNNER_TEMP/preflight.json" <<'PY'
