@@ -171,6 +171,69 @@ class ShelfTargetTests(unittest.TestCase):
         self.assertLessEqual(hold_cost, fleet_rate * 1.25)
 
 
+class CycleFailureTests(unittest.TestCase):
+    """A run is pinned to one proxy; a dead one must fail, not spin."""
+
+    def setUp(self):
+        import os
+
+        self._saved = dict(os.environ)
+        os.environ["AUTH_SECRET"] = "test"
+        self.generator = generator.Generator()
+
+    def tearDown(self):
+        import os
+
+        os.environ.clear()
+        os.environ.update(self._saved)
+
+    def test_limit_is_small_enough_to_rotate_proxies_quickly(self):
+        """282 relaunches over 25 minutes is what this replaces."""
+        self.assertLessEqual(self.generator.cycle_failure_limit, 10)
+        self.assertGreaterEqual(self.generator.cycle_failure_limit, 2)
+
+    def test_backoff_is_bounded(self):
+        waits = [min(5 * n, 60) for n in range(1, self.generator.cycle_failure_limit + 1)]
+        self.assertLessEqual(sum(waits), 300)
+
+
+class EnvHelperTests(unittest.TestCase):
+    """A GitHub expression that evaluates to "" sets the var to empty, not unset."""
+
+    def setUp(self):
+        import os
+
+        self._saved = dict(os.environ)
+
+    def tearDown(self):
+        import os
+
+        os.environ.clear()
+        os.environ.update(self._saved)
+
+    def test_blank_falls_back_to_the_default(self):
+        import os
+
+        os.environ["TOKENS_PER_MINUTE"] = ""
+        os.environ["BUDGET_SLOTS"] = "  "
+        self.assertEqual(generator.env_float("TOKENS_PER_MINUTE", 1.5), 1.5)
+        self.assertEqual(generator.env_int("BUDGET_SLOTS", 2), 2)
+
+    def test_set_values_still_win(self):
+        import os
+
+        os.environ["TOKENS_PER_MINUTE"] = "120"
+        os.environ["BUDGET_SLOTS"] = "4"
+        self.assertEqual(generator.env_float("TOKENS_PER_MINUTE", 1.5), 120.0)
+        self.assertEqual(generator.env_int("BUDGET_SLOTS", 2), 4)
+
+    def test_missing_falls_back(self):
+        import os
+
+        os.environ.pop("TOKENS_PER_MINUTE", None)
+        self.assertEqual(generator.env_float("TOKENS_PER_MINUTE", 1.5), 1.5)
+
+
 class StatsUrlTests(unittest.TestCase):
     def test_derives_stats_from_add(self):
         self.assertEqual(

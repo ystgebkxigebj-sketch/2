@@ -12,6 +12,14 @@ on:
         description: Generator runtime before clean successor handoff
         required: true
         default: "330"
+      use_proxy:
+        description: >-
+          Route the browser through a CAMOUFOX_PROXIES exit. "false" solves
+          direct from the runner IP, which costs zero Webshare bandwidth.
+        required: false
+        default: "true"
+        type: choice
+        options: ["true", "false"]
 
 permissions:
   actions: write
@@ -27,7 +35,14 @@ jobs:
     timeout-minutes: 355
     env:
       PYTHONUNBUFFERED: "1"
-      REQUIRE_PROXY: "1"
+      # The proxy exists so Cloudflare will serve the challenge, NOT so gartic
+      # will accept the token: the Oracle VM solves proxy-free from a datacenter
+      # IP and those tokens join fine (verified 2026-07-24). The 600010 errors
+      # that motivated the proxy were measured on Camoufox 152 — v135 saw zero
+      # in the same direct-connection A/B — so the proxy may be unnecessary now
+      # that the browser is pinned. use_proxy=false tests exactly that, and if it
+      # holds it removes the Webshare dependency (and the 250 GB cap) entirely.
+      REQUIRE_PROXY: ${{ inputs.use_proxy == 'false' && '0' || '1' }}
       # One tab, N lanes — never the reverse. Each tab gets its own browser
       # context and therefore its own cold HTTP cache; lanes share one.
       NUM_TABS: "1"
@@ -50,6 +65,10 @@ jobs:
       # cannot drift apart — change it here and nowhere else.
       BUDGET_GB_PER_30D: "60"
       BUDGET_SLOTS: "2"
+      # A proxyless run spends no metered bytes, so the byte budget has nothing
+      # to protect — override the derived rate and let it run. Relay
+      # backpressure still applies, so it stops when nobody is consuming.
+      TOKENS_PER_MINUTE: ${{ inputs.use_proxy == 'false' && '120' || '' }}
 
       MAX_RUNTIME_MINUTES: ${{ inputs.runtime_minutes }}
       AUTH_SECRET: ${{ secrets.CAMOUFOX_AUTH_SECRET }}
@@ -61,6 +80,7 @@ jobs:
         uses: actions/checkout@v4
 
       - name: Select and mask this slot's proxy
+        if: inputs.use_proxy != 'false'
         shell: bash
         run: |
           set -euo pipefail
@@ -149,7 +169,8 @@ jobs:
             if gh workflow run gartic-camoufox-pinned.yml \
               --ref "$GITHUB_REF_NAME" \
               -f slot='${{ inputs.slot }}' \
-              -f runtime_minutes='${{ inputs.runtime_minutes }}'; then
+              -f runtime_minutes='${{ inputs.runtime_minutes }}' \
+              -f use_proxy='${{ inputs.use_proxy }}'; then
               echo "successor dispatched on attempt=$attempt slot=${{ inputs.slot }}"
               exit 0
             fi

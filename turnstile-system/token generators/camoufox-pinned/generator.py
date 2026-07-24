@@ -45,11 +45,16 @@ MB_PER_TOKEN = float(os.environ.get("MB_PER_TOKEN", DEFAULT_MB_PER_TOKEN))
 
 
 def env_int(name: str, default: int) -> int:
-    return int(os.environ.get(name, str(default)))
+    # A workflow expression that evaluates to "" sets the variable to empty
+    # rather than leaving it unset, so treat blank as absent instead of dying
+    # on int("").
+    raw = os.environ.get(name, "").strip()
+    return int(raw) if raw else default
 
 
 def env_float(name: str, default: float) -> float:
-    return float(os.environ.get(name, str(default)))
+    raw = os.environ.get(name, "").strip()
+    return float(raw) if raw else default
 
 
 def parse_proxy(raw: str) -> dict[str, str]:
@@ -201,6 +206,11 @@ class Generator:
         # trip the stall clock. This counts them instead.
         self.cf_error_limit = env_int("CF_ERROR_LIMIT", 10)
         self.errors_since_token = 0
+        # Browser cycles that die before producing anything — a dead proxy, a
+        # failed launch. The per-lane watchdogs live inside a cycle and never run
+        # when the launch itself throws, so this is the only backstop.
+        self.cycle_failure_limit = env_int("CYCLE_FAILURE_LIMIT", 5)
+        self.cycle_failures = 0
         # True between arming a widget and its callback; keeps the clicker quiet
         # (and byte-free) while the producer is deliberately idle.
         self.solving = True
@@ -546,14 +556,32 @@ class Generator:
             poller = asyncio.create_task(self.poll_relay_queue(session))
             try:
                 while not self.stop.is_set() and time.monotonic() < deadline:
+                    before = self.stats.callbacks
                     try:
                         await self.browser_cycle(session, deadline)
+                        if self.stats.callbacks > before:
+                            self.cycle_failures = 0
                     except Exception as error:
+                        self.cycle_failures = 0 if self.stats.callbacks > before else self.cycle_failures + 1
                         print(
-                            f"[browser] recycle after {type(error).__name__}: {error}",
+                            f"[browser] recycle after {type(error).__name__}: {error} "
+                            f"(consecutive={self.cycle_failures}/{self.cycle_failure_limit})",
                             flush=True,
                         )
-                        await asyncio.sleep(5)
+                        # A run is pinned to ONE proxy for its whole life, so a
+                        # cycle that never produces a token will never produce one:
+                        # retrying here just spins. Failing the run is the only way
+                        # to rotate proxies, because the successor dispatch picks a
+                        # new index from GITHUB_RUN_NUMBER. Without this a dead
+                        # proxy burned a slot for 25 minutes over 282 identical
+                        # `InvalidProxy` relaunches on 2026-07-24.
+                        if self.cycle_failures >= self.cycle_failure_limit:
+                            raise RuntimeError(
+                                f"{self.cycle_failures} consecutive failed browser cycles "
+                                f"({type(error).__name__}); failing the run so the successor "
+                                f"picks a different proxy"
+                            ) from error
+                        await asyncio.sleep(min(5 * self.cycle_failures, 60))
             finally:
                 self.stop.set()
                 poller.cancel()
