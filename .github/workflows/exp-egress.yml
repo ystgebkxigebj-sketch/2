@@ -145,10 +145,25 @@ jobs:
             *) echo "unmapped runner" >&2; exit 1 ;;
           esac
           echo "asset=$asset"
-          # The release CDN intermittently serves 504 on these ~700 MB assets,
-          # which plain --retry does not treat as retryable.
-          curl -fL --retry 6 --retry-delay 5 --retry-all-errors \
-            --connect-timeout 20 -o camoufox.zip "$base/$asset"
+          # The release CDN intermittently serves 504 on these ~700 MB assets and
+          # can keep doing so for a minute at a time, which outlasts any curl
+          # --retry budget. Back off in the shell instead, resume with -C - so a
+          # partial transfer is not thrown away, and only accept the file once it
+          # is a readable zip — a truncated download otherwise fails much later
+          # as a confusing "binary not found".
+          ok=""
+          for attempt in 1 2 3 4 5 6; do
+            if curl -fL --retry 3 --retry-delay 3 --retry-all-errors -C - \
+                 --connect-timeout 20 -o camoufox.zip "$base/$asset"; then
+              if python -c "import zipfile,sys; sys.exit(0 if zipfile.is_zipfile('camoufox.zip') else 1)"; then
+                ok=1; break
+              fi
+              echo "attempt $attempt: incomplete archive"
+            fi
+            echo "attempt $attempt failed; backing off"
+            sleep $(( attempt * 10 ))
+          done
+          if [[ -z "$ok" ]]; then echo "could not download $asset" >&2; exit 1; fi
           # Digest is recorded rather than asserted for the mac/win assets: only
           # the linux one has a published, already-pinned hash. Logging it here
           # is what makes pinning the others possible later.
@@ -183,10 +198,13 @@ jobs:
           python -c 'import camoufox, geoip2, playwright; print("imports=ok")'
 
       # Not preinstalled on the macOS arm64 image, so it cannot be assumed.
+      # 1.24, not 1.22: binaries linked by Go 1.22 on darwin/arm64 lack an
+      # LC_UUID load command and current dyld aborts them outright
+      # (`Abort trap: 6` before main runs).
       - name: Install Go
         uses: actions/setup-go@v5
         with:
-          go-version: "1.22"
+          go-version: "1.24"
           cache: false
 
       # The join replay has to be a separate Go binary: Python's TLS fingerprint
