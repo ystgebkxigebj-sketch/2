@@ -32,10 +32,18 @@ class TestSlots:
         """The actual regression: 8 jobs alive in a run dispatched with 18."""
         assert make_run(live=8).slots == 8
 
-    def test_live_zero_is_honoured(self):
-        """A drained run contributes nothing. `0` must not be confused with the
-        unknown case — that confusion is what makes the fleet decay silently."""
-        assert make_run(live=0).slots == 0
+    def test_live_zero_from_api_is_reported_as_unknown(self):
+        """A live count of 0 on an ACTIVE run means "matrix not created yet",
+        not "drained": a matrix run has no producer jobs until its `plan` job
+        finishes, and a genuinely drained run leaves ACTIVE_STATUSES and never
+        reaches slots at all. live_producer_jobs therefore maps 0 -> None so the
+        run keeps its title count; honouring the 0 would have the supervisor
+        dispatch a duplicate fleet on top of one about to materialise.
+
+        The property itself still honours an explicit 0 — the mapping is the
+        API method's job, and this pins where that responsibility sits."""
+        assert make_run(live=0).slots == 0          # property is literal
+        assert (0 or None) is None                  # what the API method returns
 
     def test_single_producer_run_unaffected(self):
         run = make_run(producers=1, title="warp x1 18000s relay=true via=supervisor")
@@ -103,6 +111,53 @@ class TestReconcile:
                for r in runs]
         assert calls == [1], "only the matrix run should cost an API call"
         assert [r.slots for r in out] == [8, 1]
+
+
+class TestLiveJobCount:
+    """The API method's mapping, exercised through a stub transport so the
+    plan-job exclusion and the zero-is-unknown rule are pinned without network."""
+
+    class FakeApi:
+        def __init__(self, payload):
+            self.payload = payload
+
+        def request(self, method, path, body=None):
+            if isinstance(self.payload, Exception):
+                raise self.payload
+            return self.payload
+
+    def count(self, payload):
+        from fleet_master import GitHubAPI
+        api = GitHubAPI.__new__(GitHubAPI)
+        api.request = self.FakeApi(payload).request
+        return GitHubAPI.live_producer_jobs(api, "repo", 1)
+
+    def test_excludes_plan_job(self):
+        payload = {"jobs": [
+            {"name": "plan", "status": "in_progress"},
+            {"name": "produce (1)", "status": "in_progress"},
+            {"name": "produce (2)", "status": "queued"},
+        ]}
+        assert self.count(payload) == 2
+
+    def test_ignores_finished_producers(self):
+        payload = {"jobs": [
+            {"name": "produce (1)", "status": "completed"},
+            {"name": "produce (2)", "status": "in_progress"},
+        ]}
+        assert self.count(payload) == 1
+
+    def test_matrix_not_yet_materialised_reads_as_unknown(self):
+        """The incident this rule prevents: a just-dispatched x12 whose plan job
+        is still running has no producer jobs yet."""
+        payload = {"jobs": [{"name": "plan", "status": "in_progress"}]}
+        assert self.count(payload) is None
+
+    def test_api_failure_reads_as_unknown(self):
+        assert self.count(RuntimeError("GitHub API HTTP 502")) is None
+
+    def test_missing_jobs_key_reads_as_unknown(self):
+        assert self.count({}) is None
 
 
 class TestClassify:

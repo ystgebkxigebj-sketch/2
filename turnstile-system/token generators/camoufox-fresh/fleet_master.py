@@ -236,9 +236,20 @@ class GitHubAPI:
     def live_producer_jobs(self, repo: str, run_id: int) -> int | None:
         """Producer jobs still queued/running in a run, or None if unknowable.
 
-        None (rather than 0) on failure is deliberate: it makes slots fall back
-        to the title count, so an API hiccup can never read as "this run died",
-        which would dispatch a duplicate fleet.
+        None (rather than a number) on failure is deliberate: it makes slots
+        fall back to the title count, so an API hiccup can never read as "this
+        run died", which would dispatch a duplicate fleet.
+
+        Zero is also reported as None, which looks wrong but is the same
+        argument. Only ACTIVE runs are ever queried, and a matrix run's producer
+        jobs do not exist until its short `plan` job has finished — so a
+        freshly dispatched "x12" legitimately has zero producer jobs for its
+        first minutes. Honouring that zero would tell the supervisor the run
+        contributes nothing and provoke a duplicate fleet on top of one that is
+        about to materialise. A genuinely drained run leaves ACTIVE_STATUSES and
+        is filtered out by classify() before it ever reaches here, so the only
+        cost of this choice is briefly overcounting a run in the seconds between
+        its last job ending and the run being marked complete.
         """
         try:
             data = self.request(
@@ -250,9 +261,10 @@ class GitHubAPI:
             return None
         # The short `plan` job holds a runner but produces no tokens, so it must
         # not count toward the fleet it exists to launch.
-        return sum(1 for job in jobs
+        live = sum(1 for job in jobs
                    if job.get("name") != "plan"
                    and job.get("status") in ACTIVE_STATUSES)
+        return live or None
 
     def dispatch(self, repo: str, workflow: str, branch: str, inputs: dict) -> None:
         workflow_id = urllib.parse.quote(workflow, safe="")
