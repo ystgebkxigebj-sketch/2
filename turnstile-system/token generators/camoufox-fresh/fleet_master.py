@@ -47,7 +47,7 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 
 
 # A run in any of these states is holding, or is about to hold, a slot.
@@ -376,9 +376,10 @@ def main() -> int:
     # Replace each run's title-derived size with its live job count. Only worth
     # an API call for runs that claim more than one producer: a producers=1 run
     # (everything the supervisor itself dispatches) cannot disagree with itself.
-    for run in runs:
-        if run.producers > 1:
-            run.live = api.live_producer_jobs(args.repo, run.id)
+    # Run is frozen, so this rebuilds rather than assigns.
+    runs = [replace(run, live=api.live_producer_jobs(args.repo, run.id))
+            if run.producers > 1 else run
+            for run in runs]
     plan = plan_cycle(
         runs,
         target=target,

@@ -66,6 +66,45 @@ class TestPlanCycle:
         assert plan.dispatch == 0, "documents the old behaviour this fix removes"
 
 
+class TestReconcile:
+    """Run is frozen, so the reconcile step must REBUILD each run rather than
+    assign to it. The first version of this fix assigned, which every
+    constructor-based test above still passed — and then died in production with
+    FrozenInstanceError on the one line that mattered. These exercise the real
+    code path's mechanics, not just the property it feeds."""
+
+    def test_run_is_frozen(self):
+        run = make_run()
+        try:
+            run.live = 3
+        except Exception as exc:
+            assert "rozen" in type(exc).__name__ or "rozen" in str(exc)
+        else:
+            raise AssertionError("Run must stay frozen; reconcile relies on replace()")
+
+    def test_replace_produces_a_reconciled_copy(self):
+        from dataclasses import replace
+        run = make_run()
+        assert run.slots == 18
+        assert replace(run, live=8).slots == 8
+        assert run.slots == 18, "the original must be untouched"
+
+    def test_reconcile_only_rebuilds_multi_producer_runs(self):
+        """Mirrors main()'s comprehension: producers=1 runs skip the API call."""
+        from dataclasses import replace
+        runs = [make_run(id=1, producers=18), make_run(id=2, producers=1)]
+        calls = []
+
+        def fake_live(_repo, run_id):
+            calls.append(run_id)
+            return 8
+
+        out = [replace(r, live=fake_live("repo", r.id)) if r.producers > 1 else r
+               for r in runs]
+        assert calls == [1], "only the matrix run should cost an API call"
+        assert [r.slots for r in out] == [8, 1]
+
+
 class TestClassify:
     def test_live_defaults_to_none(self):
         raw = [{"id": 5, "status": "in_progress", "created_at": "2026-07-25T00:00:00Z",
