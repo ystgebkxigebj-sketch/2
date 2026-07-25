@@ -59,10 +59,24 @@ on:
         type: choice
         options: ["false", "true"]
   schedule:
-    # Every 5 minutes. GitHub delays scheduled runs under load, which is fine:
-    # --overlap-seconds is sized so a replacement is dispatched well before its
-    # predecessor ends, and lateness eats overlap rather than creating a gap.
-    - cron: "*/5 * * * *"
+    # Every 20 minutes, NOT every 5 — the short cadence starved this supervisor
+    # of the very runner it needs to do its job.
+    #
+    # `cancel-in-progress: true` below means each tick cancels the previous one.
+    # That is right for a reconciler (always act on fresh state) but it assumes
+    # a tick can START within one interval. GitHub grants this account a runner
+    # roughly every 6-12 min under load, so a 5-minute cadence guaranteed that
+    # most ticks were cancelled while still queued: observed live as #17
+    # `cancelled` and #18 sitting queued for 37 min, during which the fleet
+    # decayed 12 -> 7 producers with nothing refilling it and the standing queue
+    # fell 2,815 -> 1,615.
+    #
+    # 20 min comfortably exceeds the grant latency, so a tick can win a runner
+    # and reconcile before its successor supersedes it. It is still far below
+    # --overlap-seconds (1800) and DURATION (18000), so replacements are still
+    # dispatched well before their predecessors expire; lateness eats overlap
+    # rather than creating a gap.
+    - cron: "*/20 * * * *"
 
 permissions:
   actions: write
