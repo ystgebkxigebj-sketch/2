@@ -79,9 +79,25 @@ class Run:
     def ours(self) -> bool:
         return self.via == "supervisor"
 
+    # Live producer jobs still queued/running inside this run. None until
+    # reconcile_slots() fills it in; see slots below for why it matters.
+    live: int | None = None
+
     @property
     def slots(self) -> int:
-        """Producer jobs this run contributes (a matrix dispatch can hold many)."""
+        """Producer jobs this run STILL contributes.
+
+        The title only says how many a run was dispatched with ("warp x18"), and
+        for a matrix run that number stops being true the moment the first job
+        finishes. Counting the title instead of live jobs made the supervisor
+        believe a decaying 18-job run was still full: it reported success every
+        tick while the fleet drained 18 -> 8 and dispatched no replacements.
+        The supervisor's own runs are producers=1, where the two agree — this
+        only bites on a manually dispatched matrix run, which is exactly when
+        the fleet is largest and the silence is most expensive.
+        """
+        if self.live is not None:
+            return self.live
         return max(1, self.producers)
 
 
@@ -217,6 +233,27 @@ class GitHubAPI:
             "GET", f"repos/{repo}/actions/workflows/{workflow_id}/runs?per_page=100")
         return data.get("workflow_runs", [])
 
+    def live_producer_jobs(self, repo: str, run_id: int) -> int | None:
+        """Producer jobs still queued/running in a run, or None if unknowable.
+
+        None (rather than 0) on failure is deliberate: it makes slots fall back
+        to the title count, so an API hiccup can never read as "this run died",
+        which would dispatch a duplicate fleet.
+        """
+        try:
+            data = self.request(
+                "GET", f"repos/{repo}/actions/runs/{run_id}/jobs?per_page=100")
+        except RuntimeError:
+            return None
+        jobs = data.get("jobs")
+        if jobs is None:
+            return None
+        # The short `plan` job holds a runner but produces no tokens, so it must
+        # not count toward the fleet it exists to launch.
+        return sum(1 for job in jobs
+                   if job.get("name") != "plan"
+                   and job.get("status") in ACTIVE_STATUSES)
+
     def dispatch(self, repo: str, workflow: str, branch: str, inputs: dict) -> None:
         workflow_id = urllib.parse.quote(workflow, safe="")
         self.request("POST", f"repos/{repo}/actions/workflows/{workflow_id}/dispatches",
@@ -336,6 +373,12 @@ def main() -> int:
 
     raw = api.list_runs(args.repo, args.workflow)
     runs = classify(raw, args.tunnel, time.time())
+    # Replace each run's title-derived size with its live job count. Only worth
+    # an API call for runs that claim more than one producer: a producers=1 run
+    # (everything the supervisor itself dispatches) cannot disagree with itself.
+    for run in runs:
+        if run.producers > 1:
+            run.live = api.live_producer_jobs(args.repo, run.id)
     plan = plan_cycle(
         runs,
         target=target,
