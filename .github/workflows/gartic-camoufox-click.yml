@@ -1,0 +1,292 @@
+name: Gartic Camoufox CLICK
+run-name: camoufox-click x1 ${{ inputs.minutes }}min ${{ inputs.appearance }} egress=${{ inputs.egress }}
+
+# ===========================================================================
+#  THE CAMOUFOX STEALTH ARM — the first Camoufox run in the post-2026-07-27
+#  world, because until now repo 2's producers HAD NO CLICK DRIVER.
+# ===========================================================================
+#
+# WHAT WAS BROKEN
+# ---------------
+# `gartic-camoufox-producers.yml` runs
+# `turnstile-system/token generators/camoufox-fresh/generator.py`, which has no
+# clicker of any kind. Since Cloudflare began escalating every datacenter
+# challenge to interactive on 2026-07-27 it renders a widget, waits, and mints
+# nothing. Run 30511497101 is the proof and the shape is important:
+#
+#     [nav] status=200 ... html_len=55733
+#     [reload:stall]                       <- the 90 s watchdog
+#     RESULT {"cf_errors": {}, "tokens": 0}
+#
+# **cf_errors is EMPTY.** Cloudflare did not refuse anything. A widget waiting
+# for a pointer is not an error, and every instrument this project had reported
+# that silence as "Camoufox cannot mint" — which is how a missing feature became
+# a false verdict about a browser.
+#
+# WHAT THIS RUN MEASURES — the SOLVE PATH, not the token count
+# ------------------------------------------------------------
+# Every token is tagged `solve=auto` or `solve=int` using the same definition as
+# repo 1's Chromium producer (`before-interactive-callback` fired). The
+# hypothesis is that acceptance tracks the solve path: an auto-passed challenge
+# yields a token gartic takes, an escalated-and-clicked one does not. Camoufox's
+# stealth may stop Cloudflare escalating at all. So the headline number is
+# **auto%**, and a Camoufox token that had to be clicked is expected to be
+# refused exactly like a Chromium one.
+#
+# `appearance: interaction-only` is deliberate and must NOT be changed to
+# `always` to make the widget clickable. In interaction-only the container is
+# 0x0 while the challenge is passing on its own and grows to ~300x68 only when
+# Cloudflare escalates — that transition IS the measurement. `always` renders a
+# visible checkbox unconditionally and destroys the signal.
+#
+# WHY THERE IS NO PREFLIGHT GATE
+# ------------------------------
+# The producers workflow gates on `experiments/egress/probe.py` minting one
+# accepted token in 120 s. probe.py has no clicker either, so that gate kills
+# this run two minutes in, every time, for the exact reason this workflow
+# exists to fix. It is deliberately absent.
+#
+# WATCHDOGS ARE >= 20 MINUTES
+# ---------------------------
+# The old 90 s stall reload and 120 s periodic reload destroyed challenges that
+# were still in progress. A watchdog shorter than the work it supervises causes
+# the failure it watches for.
+#
+# NOTHING HERE SELF-DISPATCHES and there is no cron. It is a manual experiment.
+# It does not touch CAMOUFOX_FLEET_ENABLED, and its tokens carry a `cfxclick-`
+# label, so the relay's SERVE_TRUSTED_LABELS=vm- keeps production on VM tokens
+# regardless of how this arm performs.
+
+on:
+  workflow_dispatch:
+    inputs:
+      minutes:
+        description: Minutes to mint for
+        required: true
+        default: "180"
+      lanes:
+        description: Concurrent Turnstile widgets (each needs 320px of window width)
+        required: true
+        default: "2"
+      appearance:
+        description: Widget mode — interaction-only is the measurement; do not use `always` to force a clickable rect
+        required: true
+        default: interaction-only
+        type: choice
+        options: [interaction-only, always]
+      token_interval:
+        description: Seconds a lane waits after a token before re-arming (0 = unthrottled)
+        required: true
+        default: "4"
+      egress:
+        description: warp keeps this on the SAME network as the repo-1 Chromium arm, so it is a clean stealth A/B; none = direct AS8075
+        required: true
+        default: warp
+        type: choice
+        options: [warp, none]
+      post_to_relay:
+        description: Feed the live relay (needed to score acceptance via /assign?src=)
+        required: true
+        default: "true"
+        type: choice
+        options: ["true", "false"]
+      log_rects:
+        description: Echo every RECT line (very verbose; the diag heartbeat already carries max rect per lane)
+        required: false
+        default: "false"
+        type: choice
+        options: ["false", "true"]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: camoufox-click
+  cancel-in-progress: false
+
+jobs:
+  produce:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 350
+    env:
+      PYTHONUNBUFFERED: "1"
+      AUTH_SECRET: ${{ secrets.CAMOUFOX_AUTH_SECRET }}
+      RELAY_URL: ${{ vars.CAMOUFOX_RELAY_URL || 'https://mohanadino.duckdns.org:8443/add' }}
+      SOCKS_PORT: "25344"
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Runner facts (before any tunnel)
+        run: |
+          echo "direct_egress=$(curl -4 -s --max-time 15 https://api.ipify.org || echo unknown)"
+          echo "asn=$(curl -s --max-time 15 https://ipinfo.io/org || echo unknown)"
+
+      - name: Install Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      # xvfb gives Firefox a real X display so it has a real window; xdotool
+      # drives the pointer through XTEST, which arrives as isTrusted=true.
+      # Camoufox is Firefox-based, so there is no CDP and no
+      # Input.dispatchMouseEvent — XTEST or Playwright's own mouse are the only
+      # two ways in, and this producer uses both.
+      - name: Install Firefox runtime libraries + Xvfb + xdotool
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends \
+            libasound2t64 libdbus-glib-1-2 libgbm1 libgtk-3-0 libnss3 \
+            libx11-xcb1 libxcomposite1 libxcursor1 libxdamage1 libxfixes3 \
+            libxi6 libxrandr2 libxrender1 libxss1 libxt6 libxtst6 \
+            fonts-liberation unzip xvfb xdotool
+          xdotool --version
+
+      - name: Cache Camoufox v135 browser
+        id: browser-cache
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/camoufox
+          key: camoufox-135.0.1-beta.24-lin-x86_64-61e1ec455e021720
+
+      # THE VERSION PIN, AND IT IS LOAD-BEARING. `camoufox fetch` installs v152,
+      # which yields ZERO tokens on this sitekey (measured: 70x error 600010).
+      # The exact v135 build is placed by hand and checksummed, and the Python
+      # package is pinned to the 0.4.11 that speaks to it. Never let one of the
+      # two drift: the failure is total and looks like a network problem.
+      - name: Install Camoufox 135.0.1-beta.24
+        if: steps.browser-cache.outputs.cache-hit != 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
+          url='https://github.com/daijro/camoufox/releases/download/v135.0.1-beta.24/camoufox-135.0.1-beta.24-lin.x86_64.zip'
+          expected='61e1ec455e021720af38a5cc5ff7566121363cb5b82b72f24e381ba2676a4888'
+          ok=""
+          for attempt in 1 2 3 4 5 6; do
+            if curl -fL --retry 3 --retry-delay 3 --retry-all-errors -C - \
+                 --connect-timeout 20 -o /tmp/camoufox.zip "$url"; then
+              if echo "$expected  /tmp/camoufox.zip" | sha256sum --check --strict; then ok=1; break; fi
+            fi
+            echo "attempt $attempt failed; backing off"; sleep $(( attempt * 10 ))
+          done
+          if [[ -z "$ok" ]]; then echo "could not download camoufox" >&2; exit 1; fi
+          rm -rf "$HOME/.cache/camoufox"; mkdir -p "$HOME/.cache/camoufox"
+          unzip -q /tmp/camoufox.zip -d "$HOME/.cache/camoufox"
+          printf '%s\n' '{"version":"135.0.1","release":"beta.24"}' > "$HOME/.cache/camoufox/version.json"
+          chmod -R u+rwX,go+rX "$HOME/.cache/camoufox"
+
+      - name: Install pinned Python packages
+        shell: bash
+        run: |
+          set -euo pipefail
+          python -m pip install --disable-pip-version-check \
+            'camoufox[geoip]==0.4.11' 'playwright==1.61.0'
+          python -c 'import camoufox, geoip2, playwright; print("imports=ok")'
+          "$HOME/.cache/camoufox/camoufox-bin" --version
+
+      # Same tunnel the repo-1 Chromium arm uses, so this is a browser A/B on
+      # one network rather than a browser-and-network A/B on two.
+      - name: Bring up Cloudflare WARP
+        if: inputs.egress == 'warp'
+        shell: bash
+        run: |
+          set -euo pipefail
+          chmod +x experiments/egress/warp_up.sh
+          experiments/egress/warp_up.sh "$SOCKS_PORT" | tee /tmp/warp.txt | sed 's/^/warp_/'
+          echo "PROXY=socks5://127.0.0.1:$SOCKS_PORT" >> "$GITHUB_ENV"
+          echo "EXITIP=$(sed -n 's/^exit_v4=//p' /tmp/warp.txt | tail -1)" >> "$GITHUB_ENV"
+          echo "EXITV6=$(sed -n 's/^exit_ip=//p' /tmp/warp.txt | tail -1)" >> "$GITHUB_ENV"
+          echo "COLO=$(sed -n 's/^colo=//p' /tmp/warp.txt | tail -1)" >> "$GITHUB_ENV"
+
+      - name: Start Xvfb
+        shell: bash
+        run: |
+          set -euo pipefail
+          Xvfb :99 -screen 0 1280x1024x24 -nolisten tcp >/tmp/xvfb.log 2>&1 &
+          for _ in $(seq 1 30); do
+            DISPLAY=:99 xdotool getdisplaygeometry >/dev/null 2>&1 && break
+            sleep 1
+          done
+          DISPLAY=:99 xdotool getdisplaygeometry | sed 's/^/display_geometry=/'
+          echo "DISPLAY=:99" >> "$GITHUB_ENV"
+
+      - name: Produce
+        shell: bash
+        run: |
+          set -uo pipefail
+          relay=(); rects=()
+          if [[ '${{ inputs.post_to_relay }}' == 'true' ]]; then
+            if [[ -z "${AUTH_SECRET:-}" ]]; then
+              echo "post_to_relay=true but CAMOUFOX_AUTH_SECRET is unset" >&2; exit 1
+            fi
+            relay=(--relay-url "$RELAY_URL")
+            # POST through the tunnel: the relay attributes a token to the TCP
+            # peer it arrived from, so posting on the runner's own egress would
+            # file every WARP-minted token under GitHub's address and make
+            # /assign?src=<exit> score the wrong host entirely.
+            if [[ -n "${PROXY:-}" ]]; then relay+=(--relay-proxy "$PROXY"); fi
+          fi
+          if [[ '${{ inputs.log_rects }}' == 'true' ]]; then rects=(--log-rects); fi
+          secs=$(( ${{ inputs.minutes }} * 60 ))
+          python -u 'turnstile-system/token generators/camoufox-fresh/generator_click.py' \
+            --out /tmp/tokens.jsonl \
+            --label "cfxclick-${{ inputs.egress }}" \
+            --duration "$secs" \
+            --lanes '${{ inputs.lanes }}' \
+            --appearance '${{ inputs.appearance }}' \
+            --token-interval '${{ inputs.token_interval }}' \
+            --browser-lifetime 1800 \
+            --reload-interval 0 \
+            --stall-timeout 1500 \
+            --diag-every 60 \
+            --display :99 \
+            --no-headless \
+            --humanize \
+            --window 1280x1000 \
+            --executable "$HOME/.cache/camoufox/camoufox-bin" \
+            --ff-version 135 \
+            "${rects[@]}" "${relay[@]}" 2>&1 | tee /tmp/produce.log
+
+      - name: Report
+        if: always()
+        shell: bash
+        run: |
+          tokens=$(wc -l < /tmp/tokens.jsonl 2>/dev/null || echo 0)
+          echo "=================================================="
+          echo " exit_v4=${EXITIP:-direct} exit_v6=${EXITV6:-none} colo=${COLO:-none}"
+          echo " tokens = $tokens over ${{ inputs.minutes }} min"
+          echo "=================================================="
+          # The headline number. auto% is the primary metric; the token count is
+          # not, and a run that mints < 10 tokens in an hour is an issuance /
+          # click failure and must be reported as UNTESTED, never as a negative.
+          python3 - <<'PY' || true
+          import json, collections
+          rows = []
+          try:
+              for line in open('/tmp/tokens.jsonl'):
+                  line = line.strip()
+                  if line:
+                      rows.append(json.loads(line))
+          except OSError:
+              pass
+          if not rows:
+              print("NO TOKENS. Check the [diag] lines: if `escalations` > 0 and "
+                    "`clicks` == 0 the RECT GATE never opened — that is a CLICKER "
+                    "failure, not a Cloudflare verdict, and this run is UNTESTED.")
+          else:
+              c = collections.Counter(r.get('solve', '?') for r in rows)
+              auto, inter = c.get('auto', 0), c.get('int', 0)
+              total = auto + inter
+              print(f"SOLVE PATH  auto={auto}  int={inter}  "
+                    f"auto_pct={100.0*auto/total if total else 0:.1f}%")
+              print("clicked-before-solve = "
+                    f"{sum(1 for r in rows if r.get('clicks'))}/{len(rows)}")
+          PY
+          grep -a '^PRODUCER ' /tmp/produce.log 2>/dev/null | tail -1 || \
+            echo 'PRODUCER {"error":"producer emitted no summary"}'
+          echo "--- click / rect evidence ---"
+          grep -ac 'CLICKAT' /tmp/produce.log 2>/dev/null | sed 's/^/clickat_lines=/' || true
+          grep -a '\[click\]' /tmp/produce.log 2>/dev/null | tail -5 || true
+          grep -a '\[diag\]' /tmp/produce.log 2>/dev/null | tail -5 || true
