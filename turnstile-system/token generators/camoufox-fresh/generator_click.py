@@ -458,6 +458,10 @@ class Stats:
         self.last_token_at = time.monotonic()
         self.posted = 0
         self.post_fail = 0
+        # First beacon early so a broken run is visible in ~3 minutes rather
+        # than at the first slow interval; lives on Stats so it survives the
+        # browser restarts that end each session.
+        self.next_beacon = self.started + 180.0
 
     def rate_per_min(self) -> float:
         elapsed = time.monotonic() - self.started
@@ -696,6 +700,33 @@ async def run_session(args, stats: Stats, out_handle, deadline: float | None,
             if now >= session_end or (deadline and now >= deadline):
                 return
 
+            # ── LIVE BEACON. GitHub publishes a job's log only when the JOB
+            # ENDS — the REST logs endpoint answers BlobNotFound and `gh run
+            # view --log` refuses outright — so on a 180-minute run every number
+            # this producer prints is invisible for three hours. `::notice::`
+            # writes a check-run annotation, which IS readable while the job
+            # runs (`gh api repos/O/R/check-runs/<job_id>/annotations`). That is
+            # the only live channel out of a runner, and without it the PRIMARY
+            # metric of this experiment — the auto/int solve split — cannot be
+            # read until the run is over.
+            #
+            # Cadence is deliberately slow: GitHub keeps ~10 annotations per
+            # level per step, so a chatty beacon would evict its own history.
+            if now >= stats.next_beacon:
+                stats.next_beacon = now + args.beacon_every
+                rects = ",".join(f"L{i}={w}x{h}" for i, (w, h)
+                                 in sorted(stats.rect_max.items())) or "none"
+                print(
+                    f"::notice title=camoufox-solve::t={int(now - stats.started) // 60}min "
+                    f"minted={stats.tokens} auto={stats.auto} int={stats.inter} "
+                    f"auto_pct={stats.auto_pct():.0f} clicks={stats.clicks} "
+                    f"(xdo={stats.clicks_xdo}/mouse={stats.clicks_mouse}) "
+                    f"escalations={stats.escalations} maxrect={rects} "
+                    f"errs={stats.errors or 'none'} "
+                    f"posted={stats.posted}/{stats.posted + stats.post_fail}",
+                    flush=True,
+                )
+
             if now - last_diag >= args.diag_every:
                 last_diag = now
                 rects = " ".join(f"L{i}={w}x{h}" for i, (w, h)
@@ -763,6 +794,11 @@ async def main() -> int:
                              "clicked challenge can take — a 90 s value "
                              "pre-empted every slow solve this producer had.")
     parser.add_argument("--diag-every", type=float, default=60)
+    parser.add_argument("--beacon-every", type=float, default=1200,
+                        help="seconds between ::notice:: check-run annotations "
+                             "— the ONLY channel that leaves a GitHub runner "
+                             "before the job ends. Keep it slow: GitHub retains "
+                             "roughly 10 annotations per level per step.")
     parser.add_argument("--log-rects", action="store_true",
                         help="echo every RECT line (very verbose; the [diag] "
                              "heartbeat already carries the max rect per lane)")
