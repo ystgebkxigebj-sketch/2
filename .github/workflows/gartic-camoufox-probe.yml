@@ -6,7 +6,7 @@ name: Gartic Camoufox PROBE (click-path + lane-concurrency instrumentation)
 # dispatch counts toward the fleet but is never touched by it. Get this wrong
 # and the supervisor sees zero live producers and dispatches a fresh fleet every
 # tick until it hits the hard cap.
-run-name: PROBE ${{ inputs.arm }} lanes=${{ inputs.lanes }} poll=${{ inputs.poll_ms }}ms recycle=${{ inputs.recycle_ms }}ms serialize=${{ inputs.click_serialize }} ${{ inputs.duration }}s
+run-name: PROBE ${{ inputs.arm }} lanes=${{ inputs.lanes }} poll=${{ inputs.poll_ms }}ms gate=${{ inputs.click_gate }} serialize=${{ inputs.click_serialize }} ${{ inputs.duration }}s
 
 # ===========================================================================
 #  THE FLEET-FACING SELF-HEALING CAMOUFOX PRODUCER
@@ -117,6 +117,14 @@ on:
         description: Hold a global lock across the whole xdotool mousemove/down/up sequence. There is ONE X pointer per runner; without this, concurrent lane clicks interleave and a mousedown fires wherever another lane last moved the pointer.
         required: false
         default: "false"
+      click_gate:
+        description: "rect | escalation | both. `rect` is PRODUCTION and is a NO-OP - the widget slot is a fixed 300x70 div, so the w>=20/h>=20 test passes on the first poll tick of every generation and the clicker fires blind every --click-interval from page load. `escalation` clicks only when Cloudflare calls before-interactive-callback, which is the actual signal that a click is wanted."
+        required: false
+        default: rect
+      click_rearm_ms:
+        description: Non-rect gates only. How long before a RETRY click is allowed on the same widget generation. Clicking a challenge that is still verifying is how a solve gets discarded and returned to us as cf_errors.timeout.
+        required: false
+        default: "8000"
       post_to_relay:
         description: Feed the live relay
         required: false
@@ -400,6 +408,8 @@ jobs:
             --lanes '${{ inputs.lanes }}' \
             --poll-ms '${{ inputs.poll_ms }}' \
             --recycle-ms '${{ inputs.recycle_ms }}' \
+            --click-gate '${{ inputs.click_gate }}' \
+            --click-rearm-ms '${{ inputs.click_rearm_ms }}' \
             "${ser[@]}" \
             --appearance '${{ (vars.CAMOUFOX_FLEET_APPEARANCE || 'interaction-only') }}' \
             --token-interval '${{ inputs.token_interval }}' \
