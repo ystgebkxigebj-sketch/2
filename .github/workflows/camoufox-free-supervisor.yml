@@ -105,9 +105,26 @@ jobs:
           # VARIABLE, not a literal here: variables change with one API call and
           # take effect on the next tick, with no commit and no workflow run to
           # race. An unset or unparseable value fails safe (disabled / target 0).
+          # WHICH PRODUCER THIS DISPATCHES IS THE WHOLE BALLGAME.
+          #
+          # This said `gartic-camoufox-producers.yml` until 2026-07-31. That
+          # workflow has NO CLICK DRIVER, and since Cloudflare started escalating
+          # every challenge to interactive on 2026-07-27 a browser nobody drives
+          # never clicks: it has minted ZERO ever since. The failure is silent —
+          # the runs go green, the supervisor counts them as productive, and the
+          # relay simply never sees a token. Enabling the fleet against it would
+          # have spawned CAMOUFOX_FLEET_TARGET runners producing nothing.
+          #
+          # `gartic-camoufox-fleet.yml` is the self-healing Camoufox producer
+          # (xdotool click driver + roomverify self-scoring + fingerprint ladder)
+          # measured at 3046 tokens / 98.6% accepted over 5 h on 2026-07-31.
+          #
+          # It is a VARIABLE so reverting is one API call rather than an upload:
+          #   PATCH .../actions/variables/CAMOUFOX_FLEET_WORKFLOW
+          #     {"name":"CAMOUFOX_FLEET_WORKFLOW","value":"<file>.yml"}
           python3 'turnstile-system/token generators/camoufox-fresh/fleet_master.py' \
             --repo "$GITHUB_REPOSITORY" \
-            --workflow gartic-camoufox-producers.yml \
+            --workflow "${{ vars.CAMOUFOX_FLEET_WORKFLOW || 'gartic-camoufox-fleet.yml' }}" \
             --branch "${GITHUB_REF_NAME:-main}" \
             --tunnel "${{ vars.CAMOUFOX_FLEET_TUNNEL || 'warp' }}" \
             --enabled "${{ vars.CAMOUFOX_FLEET_ENABLED }}" \
