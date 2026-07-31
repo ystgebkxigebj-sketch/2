@@ -1,0 +1,518 @@
+name: Gartic Camoufox PROBE (click-path + lane-concurrency instrumentation)
+# The supervisor PARSES this title, so its shape is load-bearing:
+#   "<tunnel> x<producers> <duration>s relay=<bool> via=<who>"
+# See TITLE_RE in camoufox-fresh/fleet_master.py. `via=supervisor` is also the
+# marker that makes a run eligible to be cancelled by the supervisor; a manual
+# dispatch counts toward the fleet but is never touched by it. Get this wrong
+# and the supervisor sees zero live producers and dispatches a fresh fleet every
+# tick until it hits the hard cap.
+run-name: PROBE ${{ inputs.arm }} lanes=${{ inputs.lanes }} poll=${{ inputs.poll_ms }}ms recycle=${{ inputs.recycle_ms }}ms serialize=${{ inputs.click_serialize }} ${{ inputs.duration }}s
+
+# ===========================================================================
+#  THE FLEET-FACING SELF-HEALING CAMOUFOX PRODUCER
+# ===========================================================================
+#
+# WHY THIS FILE EXISTS AT ALL
+# ---------------------------
+# `camoufox-free-supervisor.yml` dispatched `gartic-camoufox-producers.yml` —
+# the OLD Camoufox producer, which has NO CLICK DRIVER. Since Cloudflare began
+# escalating every challenge to interactive on 2026-07-27, a browser nobody
+# drives never clicks, so that workflow has minted NOTHING. Flipping
+# CAMOUFOX_FLEET_ENABLED to "true" without repointing the supervisor would have
+# spawned CAMOUFOX_FLEET_TARGET runners that all produce zero.
+#
+# This workflow is `gartic-camoufox-selfheal.yml` — the arm that measured
+# 3046 tokens / 345 accepted / 5 refused = 98.6% over 5 h on 2026-07-31 — wearing
+# the input contract and run-name the supervisor speaks. It is a SEPARATE FILE
+# rather than an edit of that one so the manual experiment arm stays free to be
+# retuned without disturbing a 24/7 fleet, and so reverting is a single delete.
+#
+# WHAT THE SUPERVISOR SENDS, AND WHAT IT DOES NOT
+# -----------------------------------------------
+# fleet_master.py dispatches exactly six inputs: tunnel, producers, duration,
+# token_interval, post_to_relay, dispatched_by. Any input this workflow declares
+# beyond those must be OPTIONAL, because GitHub rejects a dispatch that omits a
+# required input, and any input the supervisor sends that this workflow does NOT
+# declare makes the dispatch fail with HTTP 422 — silently, from the supervisor's
+# point of view, since it dispatches and moves on.
+#
+# So every remaining knob is a repository VARIABLE, not an input. That is the
+# better half of the trade anyway: a variable changes with one API call and takes
+# effect on the very next run, with no commit, no upload and no workflow edit to
+# race — which is exactly what you want while tuning a live fleet.
+#
+#   CAMOUFOX_FLEET_LANES           concurrent Turnstile widgets  (default 2)
+#   CAMOUFOX_FLEET_APPEARANCE      interaction-only | always     (default interaction-only)
+#   CAMOUFOX_FLEET_TOKEN_INTERVAL  seconds a lane waits after a token (default 4)
+#   CAMOUFOX_FLEET_VERIFY_EVERY    seconds between self-verifications (default 90)
+#   CAMOUFOX_FLEET_COLLAPSE        consecutive code-5 that declare a collapse (default 5)
+#   CAMOUFOX_FLEET_LADDER          escalate the fingerprint ladder (default true)
+#   CAMOUFOX_FLEET_CHROMIUM        keep rung 4 as an in-run control (default FALSE here)
+#   CAMOUFOX_FLEET_LOG_RECTS       echo every RECT line (default false)
+#   CAMOUFOX_FLEET_ALT_URL/_SHA    optional rung-3 alternate Camoufox build
+#
+# `token_interval` is DECLARED (the supervisor sends it) and then deliberately
+# IGNORED in favour of CAMOUFOX_FLEET_TOKEN_INTERVAL: fleet_master.py hard-codes
+# it to "0", which is unthrottled, and the configuration actually measured at
+# 98.6% acceptance used 4. Silently inheriting an unmeasured value from a
+# supervisor default is how a tuned fleet quietly stops being the thing that
+# was tested.
+#
+# EVERY RUNNER GETS ITS OWN LABEL (`cfxheal-warp-f<run_number>`). A shared label
+# is unusable at fleet scale: /stats/exits rows key on IP, WARP IPv4 is anycast
+# and reused (measured 2026-07-31: one row carried both `cfxheal-warp-fleet` and
+# `vm-l2`, and one runner posted from three addresses in six minutes), and the
+# self-verification beacon is appended to the LABEL — so N runners sharing one
+# label produce interleaved beacons that cannot be told apart, and a single stuck
+# runner stays invisible inside a healthy average. The run number also maps a
+# label straight back to its Actions run.
+#
+# CHROMIUM (rung 4) IS OFF BY DEFAULT HERE and on in the manual arm. The rung
+# exists to be an in-run control that is expected to be WORSE — valuable in an
+# experiment, pure downside in production, where it would also add ~90 s of
+# install to every one of N runners.
+#
+# NOTHING HERE SELF-DISPATCHES, and there is no cron. A dying run's `if: always()`
+# successor dispatch is the documented runaway-respawn incident that burned ~15
+# runs; only the supervisor dispatches, and only while CAMOUFOX_FLEET_ENABLED is
+# exactly "true". Stop order is DISABLE THE SWITCH FIRST, THEN CANCEL.
+
+on:
+  workflow_dispatch:
+    inputs:
+      # ── the supervisor's contract. Names and count must match fleet_master.py.
+      tunnel:
+        description: Egress. Only `warp` is supported here — direct AS8075 mints ZERO (Cloudflare error 600010), so WARP is load-bearing for ISSUANCE.
+        required: true
+        default: warp
+      producers:
+        description: Producers in THIS dispatch. The supervisor always sends 1 and runs N independent runs; anything else is ignored.
+        required: false
+        default: "1"
+      duration:
+        description: SECONDS to mint for (the supervisor speaks seconds, not minutes). Keep <= 20400 so setup + run stays under the 355-minute job timeout.
+        required: true
+        default: "18000"
+      token_interval:
+        description: Seconds a lane pauses after emitting a token. Kept at the fleet's 4 in every probe arm — the token_interval A/B belongs to a different experiment and varying it here would confound the click-path measurement.
+        required: false
+        default: "4"
+      arm:
+        description: Short arm name; becomes the relay label suffix and the run title.
+        required: true
+        default: base
+      lanes:
+        description: Concurrent Turnstile widgets on the one page.
+        required: false
+        default: "2"
+      poll_ms:
+        description: Widget poll tick in ms. Production is 1000, which spends ~0.5 s detecting the rect and ~0.5 s detecting the token, per token, on our own timer.
+        required: false
+        default: "1000"
+      recycle_ms:
+        description: Pause between turnstile.remove() and the lane's next render().
+        required: false
+        default: "400"
+      click_serialize:
+        description: Hold a global lock across the whole xdotool mousemove/down/up sequence. There is ONE X pointer per runner; without this, concurrent lane clicks interleave and a mousedown fires wherever another lane last moved the pointer.
+        required: false
+        default: "false"
+      post_to_relay:
+        description: Feed the live relay
+        required: false
+        default: "true"
+      dispatched_by:
+        description: Who dispatched this. `supervisor` marks the run as the supervisor's own to cancel; anything else is counted but never touched.
+        required: false
+        default: manual
+
+permissions:
+  contents: read
+
+# PER-RUN UNIQUE. A fleet is many independent runners by definition, so there
+# must be no shared group: with `cancel-in-progress: false` a shared group queues
+# every runner behind the first (a hard cap of one), and with `true` it cancels
+# the incumbent, which is the opposite of the overlap the supervisor relies on to
+# avoid a coverage gap.
+concurrency:
+  group: camoufox-probe-${{ github.run_id }}
+  cancel-in-progress: false
+
+jobs:
+  produce:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 355
+    env:
+      PYTHONUNBUFFERED: "1"
+      AUTH_SECRET: ${{ secrets.CAMOUFOX_AUTH_SECRET }}
+      RELAY_URL: ${{ vars.CAMOUFOX_RELAY_URL || 'https://mohanadino.duckdns.org:8443/add' }}
+      SOCKS_PORT: "25344"
+
+    steps:
+      - uses: actions/checkout@v4
+
+      # FAIL FAST rather than mint nothing for five hours. Only `warp` wires up
+      # a proxy below; any other tunnel silently leaves PROXY unset, the browser
+      # egresses direct from AS8075, and Cloudflare answers every challenge with
+      # error 600010 — a run that looks alive, burns a runner slot the supervisor
+      # believes is productive, and produces zero.
+      - name: Guard — this workflow only supports warp egress
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ '${{ inputs.tunnel }}' != 'warp' ]]; then
+            echo "tunnel='${{ inputs.tunnel }}' is not supported by this workflow." >&2
+            echo "Set the repo variable CAMOUFOX_FLEET_TUNNEL=warp." >&2
+            exit 1
+          fi
+          echo "tunnel=warp ok"
+
+      - name: Runner facts (before any tunnel)
+        run: |
+          echo "direct_egress=$(curl -4 -s --max-time 15 https://api.ipify.org || echo unknown)"
+          echo "asn=$(curl -s --max-time 15 https://ipinfo.io/org || echo unknown)"
+
+      - name: Install Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      # xvfb gives Firefox a real X display so it has a real window; xdotool
+      # drives the pointer through XTEST, which arrives as isTrusted=true.
+      # Camoufox is Firefox-based, so there is no CDP and no
+      # Input.dispatchMouseEvent — XTEST or Playwright's own mouse are the only
+      # two ways in, and this producer uses both.
+      - name: Install Firefox runtime libraries + Xvfb + xdotool
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends \
+            libasound2t64 libdbus-glib-1-2 libgbm1 libgtk-3-0 libnss3 \
+            libx11-xcb1 libxcomposite1 libxcursor1 libxdamage1 libxfixes3 \
+            libxi6 libxrandr2 libxrender1 libxss1 libxt6 libxtst6 \
+            fonts-liberation unzip xvfb xdotool
+          xdotool --version
+
+      - name: Cache Camoufox v135 browser
+        id: browser-cache
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/camoufox
+          key: camoufox-135.0.1-beta.24-lin-x86_64-61e1ec455e021720
+
+      # THE VERSION PIN, AND IT IS LOAD-BEARING. `camoufox fetch` installs v152,
+      # which yields ZERO tokens on this sitekey (measured: 70x error 600010).
+      # The exact v135 build is placed by hand and checksummed, and the Python
+      # package is pinned to the 0.4.11 that speaks to it. Never let one of the
+      # two drift: the failure is total and looks like a network problem.
+      - name: Install Camoufox 135.0.1-beta.24
+        if: steps.browser-cache.outputs.cache-hit != 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
+          url='https://github.com/daijro/camoufox/releases/download/v135.0.1-beta.24/camoufox-135.0.1-beta.24-lin.x86_64.zip'
+          expected='61e1ec455e021720af38a5cc5ff7566121363cb5b82b72f24e381ba2676a4888'
+          ok=""
+          for attempt in 1 2 3 4 5 6; do
+            if curl -fL --retry 3 --retry-delay 3 --retry-all-errors -C - \
+                 --connect-timeout 20 -o /tmp/camoufox.zip "$url"; then
+              if echo "$expected  /tmp/camoufox.zip" | sha256sum --check --strict; then ok=1; break; fi
+            fi
+            echo "attempt $attempt failed; backing off"; sleep $(( attempt * 10 ))
+          done
+          if [[ -z "$ok" ]]; then echo "could not download camoufox" >&2; exit 1; fi
+          rm -rf "$HOME/.cache/camoufox"; mkdir -p "$HOME/.cache/camoufox"
+          unzip -q /tmp/camoufox.zip -d "$HOME/.cache/camoufox"
+          printf '%s\n' '{"version":"135.0.1","release":"beta.24"}' > "$HOME/.cache/camoufox/version.json"
+          chmod -R u+rwX,go+rX "$HOME/.cache/camoufox"
+
+      # RUNG 3. Skipped unless the operator supplies BOTH a URL and its sha256:
+      # an unpinned build is an issuance risk, and swapping an acceptance problem
+      # for an issuance one is not a fix. A failure here is not fatal — the rung
+      # simply stays out of the ladder.
+      - name: Fetch the optional alternate Camoufox build (rung 3)
+        if: (vars.CAMOUFOX_FLEET_ALT_URL || '') != '' && (vars.CAMOUFOX_FLEET_ALT_SHA || '') != ''
+        continue-on-error: true
+        shell: bash
+        run: |
+          set -euo pipefail
+          curl -fL --retry 3 --retry-all-errors --connect-timeout 20 \
+            -o /tmp/camoufox-alt.zip '${{ (vars.CAMOUFOX_FLEET_ALT_URL || '') }}'
+          echo '${{ (vars.CAMOUFOX_FLEET_ALT_SHA || '') }}  /tmp/camoufox-alt.zip' | sha256sum --check --strict
+          mkdir -p "$HOME/.cache/camoufox-alt"
+          unzip -q /tmp/camoufox-alt.zip -d "$HOME/.cache/camoufox-alt"
+          printf '%s\n' '{"version":"alt","release":"alt"}' > "$HOME/.cache/camoufox-alt/version.json"
+          chmod -R u+rwX,go+rX "$HOME/.cache/camoufox-alt"
+          echo "ALT_EXECUTABLE=$HOME/.cache/camoufox-alt/camoufox-bin" >> "$GITHUB_ENV"
+
+      - name: Install pinned Python packages
+        shell: bash
+        run: |
+          set -euo pipefail
+          python -m pip install --disable-pip-version-check \
+            'camoufox[geoip]==0.4.11' 'playwright==1.61.0'
+          python -c 'import camoufox, geoip2, playwright; print("imports=ok")'
+          "$HOME/.cache/camoufox/camoufox-bin" --version
+
+      # RUNG 4's browser. continue-on-error because a missing Chromium must
+      # degrade the ladder by one rung, never kill a 300-minute producer: the
+      # generator catches the launch failure and escalates past it.
+      - name: Install Playwright Chromium (rung 4 control)
+        if: (vars.CAMOUFOX_FLEET_CHROMIUM || 'false') == 'true'
+        continue-on-error: true
+        shell: bash
+        run: |
+          set -uo pipefail
+          sudo "$(command -v python)" -m playwright install-deps chromium || true
+          python -m playwright install chromium
+          echo "chromium installed"
+
+      - name: Go toolchain (roomverify needs >= the version in its go.mod)
+        uses: actions/setup-go@v5
+        with:
+          go-version: "stable"
+          cache: false
+
+      - name: Build roomverify
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd tools/roomverify
+          go build -o /tmp/roomverify .
+          echo "built $(ls -l /tmp/roomverify | awk '{print $5}') bytes"
+          # Informational only, and deliberately NOT fatal: gartic's WAF answers
+          # some GitHub runner addresses with a 403 block page, which fails for
+          # reasons that have nothing to do with the verifier. The binding gate
+          # runs after the tunnel is up.
+          /tmp/roomverify -list-rooms 19 | head -3 | sed 's/^/direct_room=/' || \
+            echo "direct roster unavailable (expected on some GitHub addresses)"
+
+      # Same tunnel every previous GitHub arm used, so this stays a browser
+      # experiment on one network rather than a browser-and-network experiment.
+      - name: Bring up Cloudflare WARP
+        if: inputs.tunnel == 'warp'
+        shell: bash
+        run: |
+          set -euo pipefail
+          chmod +x experiments/egress/warp_up.sh
+          experiments/egress/warp_up.sh "$SOCKS_PORT" | tee /tmp/warp.txt | sed 's/^/warp_/'
+          echo "PROXY=socks5://127.0.0.1:$SOCKS_PORT" >> "$GITHUB_ENV"
+          echo "EXITIP=$(sed -n 's/^exit_v4=//p' /tmp/warp.txt | tail -1)" >> "$GITHUB_ENV"
+          echo "EXITV6=$(sed -n 's/^exit_ip=//p' /tmp/warp.txt | tail -1)" >> "$GITHUB_ENV"
+          echo "COLO=$(sed -n 's/^colo=//p' /tmp/warp.txt | tail -1)" >> "$GITHUB_ENV"
+
+      # ── THE BINDING GATE, on the path the producer will actually use.
+      # A verifier that cannot answer REFUSED_token for an obviously bogus token
+      # is measuring itself, not gartic. A verifier with no room roster has
+      # nothing to dial. Either one leaves a 300-minute run with no acceptance
+      # signal at all — and the allow-list would correctly report `settled=0`
+      # rather than a comforting fake number, which is right but useless. Fail in
+      # 30 seconds instead.
+      - name: Gate — roomverify must work on the producer's own egress
+        shell: bash
+        run: |
+          set -euo pipefail
+          args=(); [ -n "${PROXY:-}" ] && args=(-proxy "$PROXY")
+          echo "--- roster (expect > 0 rooms) ---"
+          /tmp/roomverify "${args[@]}" -list-rooms 19,2,1,0,5 > /tmp/rooms.txt
+          echo "rooms=$(wc -l < /tmp/rooms.txt) via ${PROXY:-direct}"
+          test "$(wc -l < /tmp/rooms.txt)" -gt 0
+          echo "--- bogus token (expect bucket REFUSED_token) ---"
+          /tmp/roomverify "${args[@]}" -room "$(head -1 /tmp/rooms.txt)" \
+            '1.AAAAAAAAAAAA.BBBBBBBB' | tee /tmp/selftest.json
+          grep -q '"bucket":"REFUSED_token"' /tmp/selftest.json
+
+      # ── CPU accounting. A GitHub public runner is 4 vCPU and the cost model is
+      # ~6.7 %CPU per tok/min, so raising --lanes eventually stops buying rate.
+      # Without this you cannot tell a CPU wall (rate flattens, CPU pinned near
+      # 100% of all cores, acceptance unchanged) from a Cloudflare wall (rate
+      # flattens with CPU headroom to spare, or acceptance falls) — and the two
+      # need opposite responses: more runners versus fewer widgets.
+      - name: Start CPU sampler
+        shell: bash
+        run: |
+          cat > /tmp/cpusample.py <<'PY'
+          import json, os, time
+          def snap():
+              with open("/proc/stat") as fh:
+                  vals = [int(x) for x in fh.readline().split()[1:]]
+              return sum(vals), vals[3]          # total jiffies, idle jiffies
+          ncpu = os.cpu_count() or 1
+          prev = snap(); t0 = time.time()
+          out = open("/tmp/cpu.log", "w", buffering=1)
+          while True:
+              time.sleep(30)
+              cur = snap()
+              dt, di = cur[0] - prev[0], cur[1] - prev[1]
+              prev = cur
+              # (total-idle)/total is the fraction of ALL cores that were busy,
+              # so 100 means every core saturated — not one core saturated.
+              busy = 100.0 * (dt - di) / dt if dt else 0.0
+              print(json.dumps({"t": round(time.time() - t0),
+                                "all_cores_pct": round(busy, 1),
+                                "load1": round(os.getloadavg()[0], 2),
+                                "ncpu": ncpu}), file=out, flush=True)
+          PY
+          nohup python3 /tmp/cpusample.py >/dev/null 2>&1 &
+          echo "cpu_sampler_started ncpu=$(nproc) mem=$(free -m | awk '/^Mem:/{print $2}')MB"
+
+      - name: Start Xvfb
+        shell: bash
+        run: |
+          set -euo pipefail
+          Xvfb :99 -screen 0 1280x1024x24 -nolisten tcp >/tmp/xvfb.log 2>&1 &
+          for _ in $(seq 1 30); do
+            DISPLAY=:99 xdotool getdisplaygeometry >/dev/null 2>&1 && break
+            sleep 1
+          done
+          DISPLAY=:99 xdotool getdisplaygeometry | sed 's/^/display_geometry=/'
+          echo "DISPLAY=:99" >> "$GITHUB_ENV"
+
+      - name: Produce
+        shell: bash
+        run: |
+          set -uo pipefail
+          relay=(); rects=(); ladder=(); chrome=(); alt=()
+          if [[ '${{ inputs.post_to_relay }}' == 'true' ]]; then
+            if [[ -z "${AUTH_SECRET:-}" ]]; then
+              echo "post_to_relay=true but CAMOUFOX_AUTH_SECRET is unset" >&2; exit 1
+            fi
+            relay=(--relay-url "$RELAY_URL")
+            # POST through the tunnel: the relay attributes a token to the TCP
+            # peer it arrived from, so posting on the runner's own egress would
+            # file every WARP-minted token under GitHub's address and make
+            # /assign?src=<exit> score the wrong host entirely.
+            if [[ -n "${PROXY:-}" ]]; then relay+=(--relay-proxy "$PROXY"); fi
+          fi
+          if [[ '${{ (vars.CAMOUFOX_FLEET_LOG_RECTS || 'false') }}' == 'true' ]]; then rects=(--log-rects); fi
+          ladder=(--no-ladder)   # measure, do not react — see the note above
+          if [[ '${{ (vars.CAMOUFOX_FLEET_CHROMIUM || 'false') }}' != 'true' ]]; then
+            chrome=(--no-chromium-fallback)
+          fi
+          if [[ -n "${ALT_EXECUTABLE:-}" ]]; then alt=(--alt-executable "$ALT_EXECUTABLE"); fi
+          secs=${{ inputs.duration }}
+          if [[ '${{ inputs.click_serialize }}' == 'true' ]]; then ser=(--click-serialize); else ser=(); fi
+          python -u 'turnstile-system/token generators/camoufox-fresh/generator_probe.py' \
+            --out /tmp/tokens.jsonl \
+            --label "probe-${{ inputs.arm }}-f${{ github.run_number }}" \
+            --duration "$secs" \
+            --lanes '${{ inputs.lanes }}' \
+            --poll-ms '${{ inputs.poll_ms }}' \
+            --recycle-ms '${{ inputs.recycle_ms }}' \
+            "${ser[@]}" \
+            --appearance '${{ (vars.CAMOUFOX_FLEET_APPEARANCE || 'interaction-only') }}' \
+            --token-interval '${{ inputs.token_interval }}' \
+            --browser-lifetime 1800 \
+            --reload-interval 0 \
+            --stall-timeout 1500 \
+            --diag-every 60 \
+            --display :99 \
+            --no-headless \
+            --humanize \
+            --window 1280x1000 \
+            --executable "$HOME/.cache/camoufox/camoufox-bin" \
+            --ff-version 135 \
+            --verify-binary /tmp/roomverify \
+            --verify-every '${{ (vars.CAMOUFOX_FLEET_VERIFY_EVERY || '90') }}' \
+            --verify-start-delay 120 \
+            --verify-langs 19,2,1,0,5 \
+            --collapse-threshold '${{ (vars.CAMOUFOX_FLEET_COLLAPSE || '5') }}' \
+            --rung-min-dwell 240 \
+            "${ladder[@]}" "${chrome[@]}" "${alt[@]}" \
+            "${rects[@]}" "${relay[@]}" 2>&1 | tee /tmp/produce.log
+
+      - name: Report
+        if: always()
+        shell: bash
+        run: |
+          tokens=$(wc -l < /tmp/tokens.jsonl 2>/dev/null || echo 0)
+          echo "=================================================="
+          echo " exit_v4=${EXITIP:-direct} exit_v6=${EXITV6:-none} colo=${COLO:-none}"
+          echo " tokens = $tokens over ${{ inputs.duration }} s"
+          echo "=================================================="
+          # ── ISSUANCE and ACCEPTANCE fail for completely different reasons and
+          # the fix differs entirely, so they are always reported separately.
+          echo "--- ISSUANCE ---"
+          grep -a '^PRODUCER ' /tmp/produce.log 2>/dev/null | tail -1 || \
+            echo 'PRODUCER {"error":"producer emitted no summary"}'
+          python3 - <<'PY' || true
+          import json, collections
+          rows = []
+          try:
+              for line in open('/tmp/tokens.jsonl'):
+                  line = line.strip()
+                  if line:
+                      rows.append(json.loads(line))
+          except OSError:
+              pass
+          if not rows:
+              print("NO TOKENS. Check the [diag] lines: if `escalations` > 0 and "
+                    "`clicks` == 0 the RECT GATE never opened — that is a CLICKER "
+                    "failure, not a Cloudflare verdict, and this run is UNTESTED.")
+          else:
+              c = collections.Counter(r.get('solve', '?') for r in rows)
+              auto, inter = c.get('auto', 0), c.get('int', 0)
+              total = auto + inter
+              print(f"SOLVE PATH  auto={auto}  int={inter}  "
+                    f"auto_pct={100.0*auto/total if total else 0:.1f}%")
+              print(f"diverted to self-verify = "
+                    f"{sum(1 for r in rows if r.get('diverted'))}/{len(rows)}")
+          PY
+          echo "--- ACCEPTANCE (allow-list: ACCEPTED_* and REFUSED_token only) ---"
+          grep -a '^ACCEPTANCE ' /tmp/produce.log 2>/dev/null | tail -1 || \
+            echo 'no ACCEPTANCE line — self-verification never produced a verdict'
+          sed -n '/acceptance by 10-min bin/,/^LADDER-HISTORY\|^$/p' /tmp/produce.log \
+            2>/dev/null | head -40 || true
+          echo "--- LADDER ---"
+          if grep -aq '^LADDER ' /tmp/produce.log 2>/dev/null; then
+            grep -a '^LADDER ' /tmp/produce.log
+          else
+            echo "NO ESCALATION — acceptance never hit ${{ (vars.CAMOUFOX_FLEET_COLLAPSE || '5') }} consecutive code-5."
+            echo "That is a RESULT, not a failure: it says the arm did not meet a cut"
+            echo "(or Camoufox did not experience one) during this window."
+          fi
+          echo "--- last verdicts ---"
+          grep -a '^VERIFY ' /tmp/produce.log 2>/dev/null | tail -12 || true
+          echo "--- CPU ---"
+          python3 - <<'PY' || true
+          import json
+          rows = []
+          try:
+              for line in open("/tmp/cpu.log"):
+                  line = line.strip()
+                  if line:
+                      rows.append(json.loads(line))
+          except OSError:
+              pass
+          if not rows:
+              print("no cpu samples")
+          else:
+              pcts = [r["all_cores_pct"] for r in rows]
+              pcts_sorted = sorted(pcts)
+              def pct(p):
+                  return pcts_sorted[min(len(pcts_sorted) - 1, int(p * len(pcts_sorted)))]
+              print(f"ncpu={rows[0]['ncpu']} samples={len(rows)} "
+                    f"all_cores_pct median={pct(0.5):.1f} p90={pct(0.9):.1f} "
+                    f"max={max(pcts):.1f} load1_max={max(r['load1'] for r in rows):.2f}")
+              # Steady state only: the first ~5 min is browser startup, not minting.
+              tail = [r["all_cores_pct"] for r in rows if r["t"] > 300]
+              if tail:
+                  print(f"steady-state (t>300s) mean={sum(tail)/len(tail):.1f}% "
+                        f"max={max(tail):.1f}%")
+          PY
+          echo "--- click / rect evidence ---"
+          grep -ac 'CLICKAT' /tmp/produce.log 2>/dev/null | sed 's/^/clickat_lines=/' || true
+          grep -a '\[diag\]' /tmp/produce.log 2>/dev/null | tail -5 || true
+
+      - name: Upload raw log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: camoufox-fleet-log
+          path: |
+            /tmp/produce.log
+            /tmp/tokens.jsonl
+            /tmp/cpu.log
+          if-no-files-found: warn
+          retention-days: 7
