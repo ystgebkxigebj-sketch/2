@@ -124,39 +124,70 @@ LEAN_PREFS = {
 
 
 def probe_addons() -> str:
-    """Answer 'is uBlock Origin ACTUALLY loaded in this browser' by looking at
-    the profile on disk, not by trusting a flag.
+    """Answer 'is uBlock Origin ACTUALLY loaded in this browser'.
 
-    The whole premise of the NO-UBO arm is that the runner silently ships uBO;
-    `grep -i ubo generator_click.py` returns nothing, which proves only that
-    nobody DISABLED it. Camoufox launches Firefox with `-profile <dir>` and
-    installs its default addons into `<dir>/extensions`, so reading that
-    directory out of /proc is a direct measurement of what is loaded. Best
-    effort by design: a failed probe must never take down a producer.
+    ⚠️ READ THIS BEFORE CHANGING THE PROBE. The obvious place to look —
+    `<profile>/extensions` from the `-profile` argument in /proc — is the WRONG
+    place and yields a FALSE NEGATIVE: it reports `NONE` whether or not uBO is
+    loaded, so a first version of this experiment concluded "uBO was never
+    loaded" from evidence that could not have said otherwise.
+
+    camoufox 0.4.11 does not install its default addons into the profile. It
+    appends their EXTRACTED DIRECTORY PATHS to `config['addons']`
+    (`camoufox/utils.py::launch_options` -> `add_default_addons`), serialises the
+    whole config to JSON and hands it to the browser through chunked
+    `CAMOU_CONFIG_1..N` environment variables (`camoufox/utils.py`, chunk size
+    32767 on Linux). So the authoritative runtime evidence is the browser
+    process's OWN environment, reassembled — that is what the browser was
+    actually told — cross-checked against the on-disk addon cache that
+    `get_addon_path("UBO")` resolves to.
+
+    Best effort by design: a failed probe must never take down a producer.
     """
     findings: list[str] = []
+    try:
+        from camoufox.addons import get_addon_path
+
+        cached = Path(get_addon_path("UBO"))
+        findings.append(f"addon_cache={cached} exists={cached.is_dir()}")
+    except Exception as error:  # noqa: BLE001
+        findings.append(f"addon_cache=unknown({type(error).__name__})")
+
     try:
         for entry in Path("/proc").iterdir():
             if not entry.name.isdigit():
                 continue
             try:
-                raw = (entry / "cmdline").read_bytes().split(b"\0")
+                cmd = (entry / "cmdline").read_bytes().split(b"\0")
+                first = cmd[0].decode("utf-8", "replace") if cmd else ""
+                if "camoufox" not in first.lower():
+                    continue
+                raw = (entry / "environ").read_bytes()
             except OSError:
                 continue
-            parts = [p.decode("utf-8", "replace") for p in raw if p]
-            if not parts or "camoufox" not in parts[0].lower():
-                continue
-            if "-profile" not in parts:
-                continue
-            profile = Path(parts[parts.index("-profile") + 1])
-            ext = profile / "extensions"
-            names = sorted(p.name for p in ext.iterdir()) if ext.is_dir() else []
-            findings.append(f"pid={entry.name} profile={profile} "
-                            f"extensions={names or 'NONE'}")
+            env: dict[str, str] = {}
+            for item in raw.split(b"\0"):
+                if b"=" in item:
+                    key, _, value = item.partition(b"=")
+                    env[key.decode("utf-8", "replace")] = value.decode("utf-8", "replace")
+            chunks = [env[k] for k in sorted(
+                (k for k in env if k.startswith("CAMOU_CONFIG_")),
+                key=lambda k: int(k.rsplit("_", 1)[1]))]
+            if not chunks:
+                findings.append(f"pid={entry.name} CAMOU_CONFIG=absent")
+                break
+            blob = "".join(chunks)
+            try:
+                addons = json.loads(blob).get("addons")
+            except json.JSONDecodeError:
+                # Report the raw evidence rather than nothing: a truncated or
+                # re-chunked config still answers the question by substring.
+                addons = f"unparsed(len={len(blob)}, 'addons' in blob={'addons' in blob})"
+            findings.append(f"pid={entry.name} config_addons={addons}")
             break
     except Exception as error:  # noqa: BLE001
-        return f"probe failed: {type(error).__name__}"
-    return "; ".join(findings) or "no camoufox process with -profile found"
+        findings.append(f"proc probe failed: {type(error).__name__}")
+    return " | ".join(findings) or "no camoufox process found"
 
 # Camoufox v152 yields zero tokens on this sitekey (error 600010); v135 works.
 # The workflow places that exact build by hand and passes --executable, because
