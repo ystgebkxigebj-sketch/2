@@ -335,6 +335,40 @@ jobs:
             '1.AAAAAAAAAAAA.BBBBBBBB' | tee /tmp/selftest.json
           grep -q '"bucket":"REFUSED_token"' /tmp/selftest.json
 
+      # ── CPU accounting. A GitHub public runner is 4 vCPU and the cost model is
+      # ~6.7 %CPU per tok/min, so raising --lanes eventually stops buying rate.
+      # Without this you cannot tell a CPU wall (rate flattens, CPU pinned near
+      # 100% of all cores, acceptance unchanged) from a Cloudflare wall (rate
+      # flattens with CPU headroom to spare, or acceptance falls) — and the two
+      # need opposite responses: more runners versus fewer widgets.
+      - name: Start CPU sampler
+        shell: bash
+        run: |
+          cat > /tmp/cpusample.py <<'PY'
+          import json, os, time
+          def snap():
+              with open("/proc/stat") as fh:
+                  vals = [int(x) for x in fh.readline().split()[1:]]
+              return sum(vals), vals[3]          # total jiffies, idle jiffies
+          ncpu = os.cpu_count() or 1
+          prev = snap(); t0 = time.time()
+          out = open("/tmp/cpu.log", "w", buffering=1)
+          while True:
+              time.sleep(30)
+              cur = snap()
+              dt, di = cur[0] - prev[0], cur[1] - prev[1]
+              prev = cur
+              # (total-idle)/total is the fraction of ALL cores that were busy,
+              # so 100 means every core saturated — not one core saturated.
+              busy = 100.0 * (dt - di) / dt if dt else 0.0
+              print(json.dumps({"t": round(time.time() - t0),
+                                "all_cores_pct": round(busy, 1),
+                                "load1": round(os.getloadavg()[0], 2),
+                                "ncpu": ncpu}), file=out, flush=True)
+          PY
+          nohup python3 /tmp/cpusample.py >/dev/null 2>&1 &
+          echo "cpu_sampler_started ncpu=$(nproc) mem=$(free -m | awk '/^Mem:/{print $2}')MB"
+
       - name: Start Xvfb
         shell: bash
         run: |
@@ -448,6 +482,33 @@ jobs:
           fi
           echo "--- last verdicts ---"
           grep -a '^VERIFY ' /tmp/produce.log 2>/dev/null | tail -12 || true
+          echo "--- CPU ---"
+          python3 - <<'PY' || true
+          import json
+          rows = []
+          try:
+              for line in open("/tmp/cpu.log"):
+                  line = line.strip()
+                  if line:
+                      rows.append(json.loads(line))
+          except OSError:
+              pass
+          if not rows:
+              print("no cpu samples")
+          else:
+              pcts = [r["all_cores_pct"] for r in rows]
+              pcts_sorted = sorted(pcts)
+              def pct(p):
+                  return pcts_sorted[min(len(pcts_sorted) - 1, int(p * len(pcts_sorted)))]
+              print(f"ncpu={rows[0]['ncpu']} samples={len(rows)} "
+                    f"all_cores_pct median={pct(0.5):.1f} p90={pct(0.9):.1f} "
+                    f"max={max(pcts):.1f} load1_max={max(r['load1'] for r in rows):.2f}")
+              # Steady state only: the first ~5 min is browser startup, not minting.
+              tail = [r["all_cores_pct"] for r in rows if r["t"] > 300]
+              if tail:
+                  print(f"steady-state (t>300s) mean={sum(tail)/len(tail):.1f}% "
+                        f"max={max(tail):.1f}%")
+          PY
           echo "--- click / rect evidence ---"
           grep -ac 'CLICKAT' /tmp/produce.log 2>/dev/null | sed 's/^/clickat_lines=/' || true
           grep -a '\[diag\]' /tmp/produce.log 2>/dev/null | tail -5 || true
@@ -460,5 +521,6 @@ jobs:
           path: |
             /tmp/produce.log
             /tmp/tokens.jsonl
+            /tmp/cpu.log
           if-no-files-found: warn
           retention-days: 7
