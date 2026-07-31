@@ -1739,7 +1739,8 @@ async def main() -> int:
     print(
         f"[arm] token_interval={args.token_interval}s no_ubo={args.no_ubo} "
         f"lean_prefs={args.lean_prefs} poll_ms={args.poll_ms:.0f} "
-        f"rebuild_ms={args.rebuild_ms:.0f} lanes={args.lanes}",
+        f"rebuild_ms={args.rebuild_ms:.0f} click_interval={args.click_interval} "
+        f"lanes={args.lanes}",
         flush=True,
     )
 
@@ -1807,6 +1808,7 @@ async def main() -> int:
             "arm": {"lanes": args.lanes, "token_interval": args.token_interval,
                     "no_ubo": args.no_ubo, "lean_prefs": args.lean_prefs,
                     "poll_ms": args.poll_ms, "rebuild_ms": args.rebuild_ms,
+                    "click_interval": args.click_interval,
                     "appearance": args.appearance},
         }, sort_keys=True),
         flush=True,
