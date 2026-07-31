@@ -175,7 +175,7 @@ func get(client *http.Client, target string) (int, string, http.Header, error) {
 //
 // The endpoint is behind Cloudflare and answers 403 to a bare curl: the
 // browser-shaped headers above are load-bearing, not decoration.
-func listRooms(client *http.Client, langs string, minQuant int) int {
+func listRooms(client *http.Client, langs string, minQuant int, fullOnly bool) int {
 	type room struct {
 		Code  string `json:"code"`
 		Quant int    `json:"quant"`
@@ -205,13 +205,20 @@ func listRooms(client *http.Client, langs string, minQuant int) int {
 			continue
 		}
 		for _, r := range rooms {
-			// A FULL room is a perfectly good target: code 3 proves the token was
-			// accepted and joining a full room adds nobody to it, so it is the
-			// least disruptive verdict available. No capacity filter here.
-			if r.Code != "" && !seen[r.Code] && r.Quant >= minQuant {
-				seen[r.Code] = true
-				out = append(out, r.Code)
+			// A FULL room is the BEST target, not merely an acceptable one:
+			// `code 3` proves the token was accepted (the Turnstile gate runs
+			// before the capacity check) and the join adds nobody to the room, so
+			// a verifier that dials only full rooms measures acceptance without
+			// ever putting a ghost player into somebody's game. -full asks for
+			// exactly those; without it every listed room is fair game.
+			if r.Code == "" || seen[r.Code] || r.Quant < minQuant {
+				continue
 			}
+			if fullOnly && (r.Max <= 0 || r.Quant < r.Max) {
+				continue
+			}
+			seen[r.Code] = true
+			out = append(out, r.Code)
 		}
 	}
 	if len(out) == 0 {
@@ -378,6 +385,7 @@ func main() {
 	nick := flag.String("nick", "", "nick to join with (default: random)")
 	listLangs := flag.String("list-rooms", "", "print room codes for these comma-separated language ids and exit")
 	minQuant := flag.Int("min-quant", 0, "when listing, drop rooms with fewer than this many players")
+	fullOnly := flag.Bool("full", false, "when listing, keep only FULL rooms (quant >= max) — a full room answers code 3, which proves acceptance and adds nobody to the room")
 	timeout := flag.Int("timeout", 25, "seconds to wait for a verdict frame")
 	flag.Parse()
 
@@ -389,7 +397,7 @@ func main() {
 	client := newClient(dial, hook)
 
 	if *listLangs != "" {
-		os.Exit(listRooms(client, *listLangs, *minQuant))
+		os.Exit(listRooms(client, *listLangs, *minQuant, *fullOnly))
 	}
 	if flag.NArg() < 1 || flag.Arg(0) == "" {
 		emit(result{Bucket: "NOVERDICT_other", Detail: "no-token-argument"})
