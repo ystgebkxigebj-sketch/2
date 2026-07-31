@@ -712,15 +712,31 @@ class Verifier(threading.Thread):
         # loop or, worse, falling back to `-lang N`.
         if now - self.rooms_at < 60 and self.rooms_fail:
             return
-        command = [self.args.verify_binary, "-list-rooms", self.args.verify_langs]
-        if self.args.verify_proxy:
-            command[1:1] = ["-proxy", self.args.verify_proxy]
-        try:
-            out = subprocess.run(command, capture_output=True, text=True, timeout=90)
-            codes = [c.strip() for c in out.stdout.splitlines() if c.strip()]
-        except Exception as error:  # noqa: BLE001
-            codes = []
-            print(f"  [verify] roster error {type(error).__name__}", flush=True)
+        def fetch(full: bool) -> list[str]:
+            command = [self.args.verify_binary, "-list-rooms", self.args.verify_langs]
+            if full:
+                command.append("-full")
+            if self.args.verify_proxy:
+                command[1:1] = ["-proxy", self.args.verify_proxy]
+            try:
+                out = subprocess.run(command, capture_output=True, text=True, timeout=90)
+                return [c.strip() for c in out.stdout.splitlines() if c.strip()]
+            except Exception as error:  # noqa: BLE001
+                print(f"  [verify] roster error {type(error).__name__}", flush=True)
+                return []
+
+        # PREFER FULL ROOMS. They answer code 3, which proves the token was
+        # accepted, and the join adds nobody — so a 5-hour run measures its own
+        # acceptance ~400 times without putting a single ghost player into
+        # anyone's game. Fall back to the full listing only when there are too
+        # few full rooms to rotate through.
+        codes = fetch(True)
+        if len(codes) < 8:
+            time.sleep(3)  # /req/list answers 429 if the two calls are back to back
+            codes = fetch(False)
+            if codes:
+                print(f"  [verify] too few full rooms; using the full listing",
+                      flush=True)
         if codes:
             self.rooms = codes
             self.rooms_at = now
@@ -1489,8 +1505,14 @@ async def main() -> int:
                 "accept_pct": round(100.0 * overall_acc / settled, 1) if settled else None,
                 "window_pct": round(pct, 1), "window_n": total,
                 "buckets": dict(sorted(verifier.buckets.items())),
-                "escalations": sum(1 for h in ladder.history if h["event"] == "escalate"),
-                "recoveries": sum(1 for h in ladder.history if h["event"] == "recovered"),
+                # Named `ladder_*` because the PRODUCER line above carries an
+                # `escalations` counter of its own with a completely different
+                # meaning — Cloudflare escalating a widget to interactive. The
+                # two appear within three lines of each other in the log.
+                "ladder_escalations": sum(1 for h in ladder.history
+                                          if h["event"] == "escalate"),
+                "ladder_recoveries": sum(1 for h in ladder.history
+                                         if h["event"] == "recovered"),
                 "final_rung": ladder.key(),
                 "per_rung": {k: v for k, v in sorted(ladder.tally.items())},
             }, sort_keys=True),
