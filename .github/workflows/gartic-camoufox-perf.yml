@@ -1,0 +1,407 @@
+name: Gartic Camoufox PERF A/B
+run-name: perf ${{ inputs.arm }} ti=${{ inputs.token_interval }} ubo=${{ inputs.no_ubo }} lean=${{ inputs.lean_prefs }} poll=${{ inputs.poll_ms }}
+
+# ===========================================================================
+#  PERFORMANCE A/B ARM — tokens/min from ONE GitHub Camoufox runner
+# ===========================================================================
+#
+# WHAT THIS IS FOR
+# ----------------
+# The baseline is `lanes=2, token_interval=4` => 10.26 tok/min (measured twice:
+# 10.26 and 9.34). This workflow runs ONE arm of a concurrent A/B in which every
+# arm changes exactly one thing, so the arms can be compared in the SAME minutes
+# — which matters more than usual here, because gartic's acceptance and
+# Cloudflare's challenge behaviour both move on their own over tens of minutes.
+#
+# WHY IT IS A SEPARATE FILE
+# -------------------------
+# The production fleet is LIVE at CAMOUFOX_FLEET_TARGET=12 and must not be
+# disturbed. Nothing here touches `gartic-camoufox-fleet.yml`, any
+# CAMOUFOX_FLEET_* variable, or the supervisor. Reverting this experiment is two
+# deletes: this file and `generator_perf.py`.
+#
+# EVERY KNOB IS AN INPUT, NOT A REPO VARIABLE. The fleet uses variables because
+# a supervisor dispatches it with a fixed six-input contract; here a human
+# dispatches five arms in one minute and each needs a DIFFERENT value, which a
+# repo variable cannot express.
+#
+# THE LADDER IS OFF, DELIBERATELY. Escalation drops the browser (30-60 s of lost
+# minting plus every in-flight challenge), so a run that escalates has a
+# throughput number that measures the ladder rather than the arm. The VERIFIER
+# stays on, because a rate gain that costs acceptance is worthless and the
+# verifier is the only acceptance signal a runner owns.
+#
+# THE CONCURRENCY GROUP IS PER-RUN. `gartic-camoufox-selfheal.yml` shares a
+# `camoufox-click` group with the manual arm, which serialises dispatches — the
+# exact opposite of what a same-minute A/B needs.
+#
+# ACCOUNT CEILING: 20 concurrent runners per ACCOUNT, 12 of them held by the
+# live fleet. Keep the arms to <= 5 and check `gh run list --status in_progress`
+# across repos 1, 2 and 3 before dispatching.
+
+on:
+  workflow_dispatch:
+    inputs:
+      arm:
+        description: "Arm label - baseline | noubo | lean | ti0 | combo. Travels into the relay label and the PRODUCER line so five identical logs stay tellable apart."
+        required: true
+        default: baseline
+      minutes:
+        description: Minutes to mint for. >= 30-40 or the TRUE rate is not stable.
+        required: false
+        default: "45"
+      lanes:
+        description: Concurrent Turnstile widgets. KEEP AT 2 — more is worse (10.26/8.14/8.62/8.90 tok/min for 2/4/6/8).
+        required: false
+        default: "2"
+      token_interval:
+        description: Seconds a lane deliberately waits after emitting a token. 4 is the baseline; 0 is unthrottled.
+        required: false
+        default: "4"
+      no_ubo:
+        description: Drop Camoufox's uBlock Origin addon (true/false).
+        required: false
+        default: "false"
+      lean_prefs:
+        description: Apply the VM's lean Firefox prefs (true/false).
+        required: false
+        default: "false"
+      poll_ms:
+        description: In-page poll interval in ms. 1000 is stock and costs up to 1 s before a finished token is collected and up to 1 s before an escalated widget is clicked.
+        required: false
+        default: "1000"
+      rebuild_ms:
+        description: Pause between turnstile.remove() and the next render(). 400 is stock.
+        required: false
+        default: "400"
+      appearance:
+        description: interaction-only (stock) or always. NOTE — `always` mints ZERO on this sitekey; do not use it.
+        required: false
+        default: interaction-only
+      verify_every:
+        description: Seconds between self-verifications. Identical across arms or the diverted-token tax differs between them.
+        required: false
+        default: "90"
+      post_to_relay:
+        description: Feed the live relay. Safe — `cfxperf-` is outside SERVE_TRUSTED_LABELS=vm-, so icebot never draws these tokens.
+        required: false
+        default: "true"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: camoufox-perf-${{ github.run_id }}
+  cancel-in-progress: false
+
+jobs:
+  produce:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    env:
+      PYTHONUNBUFFERED: "1"
+      AUTH_SECRET: ${{ secrets.CAMOUFOX_AUTH_SECRET }}
+      RELAY_URL: ${{ vars.CAMOUFOX_RELAY_URL || 'https://mohanadino.duckdns.org:8443/add' }}
+      SOCKS_PORT: "25344"
+      ARM: ${{ inputs.arm }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Runner facts (before any tunnel)
+        run: |
+          echo "arm=${{ inputs.arm }}"
+          echo "direct_egress=$(curl -4 -s --max-time 15 https://api.ipify.org || echo unknown)"
+          echo "asn=$(curl -s --max-time 15 https://ipinfo.io/org || echo unknown)"
+          echo "ncpu=$(nproc) mem=$(free -m | awk '/^Mem:/{print $2}')MB"
+
+      - name: Install Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install Firefox runtime libraries + Xvfb + xdotool
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends \
+            libasound2t64 libdbus-glib-1-2 libgbm1 libgtk-3-0 libnss3 \
+            libx11-xcb1 libxcomposite1 libxcursor1 libxdamage1 libxfixes3 \
+            libxi6 libxrandr2 libxrender1 libxss1 libxt6 libxtst6 \
+            fonts-liberation unzip xvfb xdotool
+          xdotool --version
+
+      - name: Cache Camoufox v135 browser
+        id: browser-cache
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/camoufox
+          key: camoufox-135.0.1-beta.24-lin-x86_64-61e1ec455e021720
+
+      # THE VERSION PIN IS LOAD-BEARING. `camoufox fetch` installs v152, which
+      # yields ZERO tokens on this sitekey (70x error 600010).
+      - name: Install Camoufox 135.0.1-beta.24
+        if: steps.browser-cache.outputs.cache-hit != 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
+          url='https://github.com/daijro/camoufox/releases/download/v135.0.1-beta.24/camoufox-135.0.1-beta.24-lin.x86_64.zip'
+          expected='61e1ec455e021720af38a5cc5ff7566121363cb5b82b72f24e381ba2676a4888'
+          ok=""
+          for attempt in 1 2 3 4 5 6; do
+            if curl -fL --retry 3 --retry-delay 3 --retry-all-errors -C - \
+                 --connect-timeout 20 -o /tmp/camoufox.zip "$url"; then
+              if echo "$expected  /tmp/camoufox.zip" | sha256sum --check --strict; then ok=1; break; fi
+            fi
+            echo "attempt $attempt failed; backing off"; sleep $(( attempt * 10 ))
+          done
+          if [[ -z "$ok" ]]; then echo "could not download camoufox" >&2; exit 1; fi
+          rm -rf "$HOME/.cache/camoufox"; mkdir -p "$HOME/.cache/camoufox"
+          unzip -q /tmp/camoufox.zip -d "$HOME/.cache/camoufox"
+          printf '%s\n' '{"version":"135.0.1","release":"beta.24"}' > "$HOME/.cache/camoufox/version.json"
+          chmod -R u+rwX,go+rX "$HOME/.cache/camoufox"
+
+      - name: Install pinned Python packages
+        shell: bash
+        run: |
+          set -euo pipefail
+          python -m pip install --disable-pip-version-check \
+            'camoufox[geoip]==0.4.11' 'playwright==1.61.0'
+          python -c 'from camoufox import DefaultAddons; print("ubo_symbol=", DefaultAddons.UBO)'
+          "$HOME/.cache/camoufox/camoufox-bin" --version
+
+      - name: Go toolchain
+        uses: actions/setup-go@v5
+        with:
+          go-version: "stable"
+          cache: false
+
+      - name: Build roomverify
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd tools/roomverify
+          go build -o /tmp/roomverify .
+          echo "built $(ls -l /tmp/roomverify | awk '{print $5}') bytes"
+
+      # Same tunnel every previous GitHub arm used. Direct AS8075 mints ZERO
+      # (Cloudflare 600010), so WARP is load-bearing for ISSUANCE and is not a
+      # variable in this experiment.
+      - name: Bring up Cloudflare WARP
+        shell: bash
+        run: |
+          set -euo pipefail
+          chmod +x experiments/egress/warp_up.sh
+          experiments/egress/warp_up.sh "$SOCKS_PORT" | tee /tmp/warp.txt | sed 's/^/warp_/'
+          echo "PROXY=socks5://127.0.0.1:$SOCKS_PORT" >> "$GITHUB_ENV"
+          echo "EXITIP=$(sed -n 's/^exit_v4=//p' /tmp/warp.txt | tail -1)" >> "$GITHUB_ENV"
+          echo "EXITV6=$(sed -n 's/^exit_ip=//p' /tmp/warp.txt | tail -1)" >> "$GITHUB_ENV"
+          echo "COLO=$(sed -n 's/^colo=//p' /tmp/warp.txt | tail -1)" >> "$GITHUB_ENV"
+
+      # A verifier that cannot answer REFUSED_token for an obviously bogus token
+      # is measuring itself. Fail in 30 seconds rather than after 45 minutes.
+      - name: Gate — roomverify must work on the producer's own egress
+        shell: bash
+        run: |
+          set -euo pipefail
+          args=(); [ -n "${PROXY:-}" ] && args=(-proxy "$PROXY")
+          /tmp/roomverify "${args[@]}" -list-rooms 19,2,1,0,5 > /tmp/rooms.txt
+          echo "rooms=$(wc -l < /tmp/rooms.txt) via ${PROXY:-direct}"
+          test "$(wc -l < /tmp/rooms.txt)" -gt 0
+          /tmp/roomverify "${args[@]}" -room "$(head -1 /tmp/rooms.txt)" \
+            '1.AAAAAAAAAAAA.BBBBBBBB' | tee /tmp/selftest.json
+          grep -q '"bucket":"REFUSED_token"' /tmp/selftest.json
+
+      # CPU accounting. The whole premise of the NO-UBO and LEAN-PREFS arms is a
+      # resource win, and the prior measurement says this host has 84% idle at
+      # lanes=8 — so this sampler is what turns "it should be faster" into a
+      # number, in both directions.
+      - name: Start CPU sampler
+        shell: bash
+        run: |
+          cat > /tmp/cpusample.py <<'PY'
+          import json, os, time
+          def snap():
+              with open("/proc/stat") as fh:
+                  vals = [int(x) for x in fh.readline().split()[1:]]
+              return sum(vals), vals[3]
+          def rss_mb():
+              total = 0
+              for pid in os.listdir("/proc"):
+                  if not pid.isdigit():
+                      continue
+                  try:
+                      with open(f"/proc/{pid}/cmdline", "rb") as fh:
+                          cmd = fh.read().split(b"\0")[0].decode("utf-8", "replace")
+                      if "camoufox" not in cmd.lower():
+                          continue
+                      with open(f"/proc/{pid}/statm") as fh:
+                          total += int(fh.read().split()[1]) * os.sysconf("SC_PAGE_SIZE")
+                  except (OSError, IndexError, ValueError):
+                      continue
+              return round(total / 1048576.0, 1)
+          ncpu = os.cpu_count() or 1
+          prev = snap(); t0 = time.time()
+          out = open("/tmp/cpu.log", "w", buffering=1)
+          while True:
+              time.sleep(30)
+              cur = snap()
+              dt, di = cur[0] - prev[0], cur[1] - prev[1]
+              prev = cur
+              busy = 100.0 * (dt - di) / dt if dt else 0.0
+              print(json.dumps({"t": round(time.time() - t0),
+                                "all_cores_pct": round(busy, 1),
+                                "camoufox_rss_mb": rss_mb(),
+                                "load1": round(os.getloadavg()[0], 2),
+                                "ncpu": ncpu}), file=out, flush=True)
+          PY
+          nohup python3 /tmp/cpusample.py >/dev/null 2>&1 &
+          echo "cpu_sampler_started"
+
+      - name: Start Xvfb
+        shell: bash
+        run: |
+          set -euo pipefail
+          Xvfb :99 -screen 0 1280x1024x24 -nolisten tcp >/tmp/xvfb.log 2>&1 &
+          for _ in $(seq 1 30); do
+            DISPLAY=:99 xdotool getdisplaygeometry >/dev/null 2>&1 && break
+            sleep 1
+          done
+          DISPLAY=:99 xdotool getdisplaygeometry | sed 's/^/display_geometry=/'
+          echo "DISPLAY=:99" >> "$GITHUB_ENV"
+
+      - name: Produce
+        shell: bash
+        run: |
+          set -uo pipefail
+          relay=(); perf=()
+          if [[ '${{ inputs.post_to_relay }}' == 'true' ]]; then
+            if [[ -z "${AUTH_SECRET:-}" ]]; then
+              echo "post_to_relay=true but CAMOUFOX_AUTH_SECRET is unset" >&2; exit 1
+            fi
+            relay=(--relay-url "$RELAY_URL")
+            if [[ -n "${PROXY:-}" ]]; then relay+=(--relay-proxy "$PROXY"); fi
+          fi
+          if [[ '${{ inputs.no_ubo }}' == 'true' ]]; then perf+=(--no-ubo); fi
+          if [[ '${{ inputs.lean_prefs }}' == 'true' ]]; then perf+=(--lean-prefs); fi
+          secs=$(( ${{ inputs.minutes }} * 60 ))
+          echo "ARM=${{ inputs.arm }} secs=$secs perf_flags=${perf[*]:-none}"
+          python -u 'turnstile-system/token generators/camoufox-fresh/generator_perf.py' \
+            --out /tmp/tokens.jsonl \
+            --label "cfxperf-${{ inputs.arm }}-${{ github.run_number }}" \
+            --duration "$secs" \
+            --lanes '${{ inputs.lanes }}' \
+            --appearance '${{ inputs.appearance }}' \
+            --token-interval '${{ inputs.token_interval }}' \
+            --poll-ms '${{ inputs.poll_ms }}' \
+            --rebuild-ms '${{ inputs.rebuild_ms }}' \
+            --browser-lifetime 100000 \
+            --reload-interval 0 \
+            --stall-timeout 1500 \
+            --diag-every 120 \
+            --display :99 \
+            --no-headless \
+            --humanize \
+            --window 1280x1000 \
+            --executable "$HOME/.cache/camoufox/camoufox-bin" \
+            --ff-version 135 \
+            --verify-binary /tmp/roomverify \
+            --verify-every '${{ inputs.verify_every }}' \
+            --verify-start-delay 120 \
+            --verify-langs 19,2,1,0,5 \
+            --no-ladder \
+            --no-chromium-fallback \
+            "${perf[@]}" "${relay[@]}" 2>&1 | tee /tmp/produce.log
+
+      - name: Report
+        if: always()
+        shell: bash
+        run: |
+          echo "=================================================="
+          echo " ARM=${{ inputs.arm }}  label=cfxperf-${{ inputs.arm }}-${{ github.run_number }}"
+          echo " exit_v4=${EXITIP:-direct} exit_v6=${EXITV6:-none} colo=${COLO:-none}"
+          echo "=================================================="
+          echo "--- ARM CONFIG AS THE PRODUCER SAW IT ---"
+          grep -a '^\[arm\]' /tmp/produce.log 2>/dev/null || echo 'no [arm] line'
+          echo "--- ADDONS ACTUALLY LOADED (measured from /proc, not assumed) ---"
+          grep -a '\[addons\]' /tmp/produce.log 2>/dev/null | head -5 || echo 'no [addons] line'
+          echo "--- ISSUANCE ---"
+          grep -a '^PRODUCER ' /tmp/produce.log 2>/dev/null | tail -1 || \
+            echo 'PRODUCER {"error":"producer emitted no summary"}'
+          echo "--- CYCLE BREAKDOWN (seconds; p50/p90 per phase) ---"
+          grep -a '^CYCLE ' /tmp/produce.log 2>/dev/null | tail -1 || echo 'no CYCLE line'
+          echo "--- TRUE RATE from token timestamps, in 10-min bins ---"
+          python3 - <<'PY' || true
+          import json, collections
+          rows = []
+          try:
+              for line in open('/tmp/tokens.jsonl'):
+                  line = line.strip()
+                  if line:
+                      rows.append(json.loads(line))
+          except OSError:
+              pass
+          if not rows:
+              print("NO TOKENS — check [diag]: escalations>0 with clicks==0 is a "
+                    "CLICKER failure, not a Cloudflare verdict.")
+          else:
+              t0 = rows[0]['ts']
+              bins = collections.Counter(int((r['ts'] - t0) // 600) for r in rows)
+              for b in sorted(bins):
+                  print(f"  t={b*10:>3}-{b*10+10:<3}min  {bins[b]:>4} tokens  "
+                        f"{bins[b]/10.0:.2f}/min")
+              span = rows[-1]['ts'] - t0
+              # TRUE rate: counter delta over OBSERVED seconds. n-1 intervals,
+              # never n/elapsed-since-process-start, which credits the arm for
+              # the ~90 s of browser launch before the first token.
+              if span > 0:
+                  print(f"TRUE_RATE tokens={len(rows)} span_s={span:.0f} "
+                        f"rate={(len(rows)-1)/span*60.0:.2f}/min")
+              c = collections.Counter(r.get('solve', '?') for r in rows)
+              print(f"SOLVE PATH auto={c.get('auto',0)} int={c.get('int',0)}")
+          PY
+          echo "--- ACCEPTANCE (allow-list: ACCEPTED_* and REFUSED_token only) ---"
+          grep -a '^ACCEPTANCE ' /tmp/produce.log 2>/dev/null | tail -1 || \
+            echo 'no ACCEPTANCE line'
+          sed -n '/acceptance by 10-min bin/,/^LADDER-HISTORY\|^$/p' /tmp/produce.log \
+            2>/dev/null | head -20 || true
+          echo "--- CPU / RSS ---"
+          python3 - <<'PY' || true
+          import json
+          rows = []
+          try:
+              for line in open("/tmp/cpu.log"):
+                  line = line.strip()
+                  if line:
+                      rows.append(json.loads(line))
+          except OSError:
+              pass
+          if not rows:
+              print("no cpu samples")
+          else:
+              tail = [r for r in rows if r["t"] > 300]
+              use = tail or rows
+              pcts = sorted(r["all_cores_pct"] for r in use)
+              rss = sorted(r.get("camoufox_rss_mb", 0) for r in use)
+              def pct(vals, p):
+                  return vals[min(len(vals) - 1, int(p * len(vals)))]
+              print(f"ncpu={rows[0]['ncpu']} steady_samples={len(use)} "
+                    f"all_cores_pct p50={pct(pcts,0.5):.1f} p90={pct(pcts,0.9):.1f} "
+                    f"max={pcts[-1]:.1f} | camoufox_rss_mb p50={pct(rss,0.5):.0f} "
+                    f"max={rss[-1]:.0f}")
+          PY
+          echo "--- click / rect evidence ---"
+          grep -a '\[diag\]' /tmp/produce.log 2>/dev/null | tail -3 || true
+
+      - name: Upload raw log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: perf-${{ inputs.arm }}-${{ github.run_number }}
+          path: |
+            /tmp/produce.log
+            /tmp/tokens.jsonl
+            /tmp/cpu.log
+          if-no-files-found: warn
+          retention-days: 7
