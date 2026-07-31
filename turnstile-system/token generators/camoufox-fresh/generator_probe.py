@@ -120,6 +120,8 @@ RENDERER_JS = r"""
   var CLICK_MIN_W = __CLICK_MIN_W__;
   var CLICK_MIN_H = __CLICK_MIN_H__;
   var POLL_MS = __POLL_MS__;
+  var CLICK_GATE = '__CLICK_GATE__';   // rect | escalation | both
+  var REARM_MS = __CLICK_REARM_MS__;   // retry spacing, non-rect gates only
   var RECYCLE_MS = __RECYCLE_MS__;
   function now() { return (window.performance && performance.now) ? performance.now() : Date.now(); }
 
@@ -182,12 +184,14 @@ RENDERER_JS = r"""
     var lastW = -1, lastH = -1, ticks = 0;
     // PHASE TIMELINE. All marks are ms since this generation's build().
     var tBuild = 0, tInter = -1, tRect = -1, tClick = -1, nClickAt = 0;
+    var wantClick = false, lastArm = 0;
 
     function build() {
       gen++;
       var myGen = gen;
       sawInter = false; emitted = false; lastW = -1; lastH = -1; ticks = 0;
       tBuild = now(); tInter = -1; tRect = -1; tClick = -1; nClickAt = 0;
+      wantClick = false; lastArm = 0;
       if (slot && slot.parentNode) slot.parentNode.removeChild(slot);
       slot = document.createElement('div');
       slot.id = 'lane_' + i + '_' + myGen;
@@ -223,7 +227,8 @@ RENDERER_JS = r"""
           'expired-callback': function () { defer(myGen, 0); },
           'timeout-callback': function () { log('E:timeout'); defer(myGen, 0); },
           'before-interactive-callback': function () {
-            sawInter = true; if (tInter < 0) tInter = now() - tBuild;
+            sawInter = true; wantClick = true;
+            if (tInter < 0) tInter = now() - tBuild;
             log('INTER lane=' + i + ' gen=' + myGen);
           },
           'after-interactive-callback': function () {
@@ -269,8 +274,26 @@ RENDERER_JS = r"""
         }
         // THE RECT GATE. Never `if (iframe)` — an escalated interaction-only
         // widget exposes no iframe, which is exactly the bug this file fixes.
-        if (w >= CLICK_MIN_W && h >= CLICK_MIN_H) {
-          if (tRect < 0) tRect = now() - tBuild;
+        var rectOK = (w >= CLICK_MIN_W && h >= CLICK_MIN_H);
+        if (rectOK && tRect < 0) tRect = now() - tBuild;
+        // rect       = production behaviour. ALWAYS true (see the module
+        //              docstring); the clicker fires blind every tick.
+        // escalation = Cloudflare called before-interactive-callback, and
+        //              only then. One click per escalation.
+        // both       = escalated AND laid out. The safe production choice.
+        var fire = (CLICK_GATE === 'rect') ? rectOK
+                 : (CLICK_GATE === 'escalation') ? wantClick
+                 : (wantClick && rectOK);
+        if (fire && CLICK_GATE !== 'rect') {
+          var tn = now();
+          // Re-arm, never spray: a click that has not yet been answered is
+          // not evidence that another click is wanted, and clicking a
+          // challenge that is mid-verification is how a solve gets thrown
+          // away and reported back to us as cf_errors.timeout.
+          if (nClickAt > 0 && (tn - lastArm) < REARM_MS) fire = false;
+          else lastArm = tn;
+        }
+        if (fire) {
           if (tClick < 0) tClick = now() - tBuild;
           nClickAt++;
           // The checkbox sits at the left end of a full-width widget; on a
@@ -344,6 +367,8 @@ def build_renderer(args) -> str:
         .replace("__CLICK_MIN_H__", str(args.click_min_h))
         .replace("__POLL_MS__", str(int(args.poll_ms)))
         .replace("__RECYCLE_MS__", str(int(args.recycle_ms)))
+        .replace("__CLICK_GATE__", args.click_gate)
+        .replace("__CLICK_REARM_MS__", str(int(args.click_rearm_ms)))
     )
 
 
@@ -544,6 +569,7 @@ class Stats:
         self.clickat_seen = 0             # CLICKAT console lines received
         self.clickat_dropped_interval = 0 # ... suppressed by --click-interval
         self.clickat_dropped_max = 0      # ... suppressed by --click-max
+        self.clicks_on_token = 0          # clicks on generations that DID mint
 
     def rate_per_min(self) -> float:
         elapsed = time.monotonic() - self.started
@@ -1162,6 +1188,7 @@ async def run_session(args, stats: Stats, out_handle, deadline: float | None,
                     stats.auto += 1
                 else:
                     stats.inter += 1
+                stats.clicks_on_token += clicked
                 if clicked:
                     stats.solved_after_click += 1
                 # DIVERT, never duplicate. A token is single-use: posting it to
@@ -1447,6 +1474,17 @@ async def main() -> int:
     parser.add_argument("--recycle-ms", type=int, default=400,
                         help="pause between turnstile.remove() and the next "
                              "render() for a lane")
+    parser.add_argument("--click-gate",
+                        choices=("rect", "escalation", "both"), default="rect",
+                        help="rect = production, and a NO-OP: the slot is a "
+                             "fixed 300x70 div so the gate is open from "
+                             "creation and the clicker fires blind every "
+                             "tick. escalation = click when "
+                             "before-interactive-callback fires, the real "
+                             "signal. both = escalated AND laid out.")
+    parser.add_argument("--click-rearm-ms", type=int, default=8000,
+                        help="non-rect gates: how long to wait before a "
+                             "RETRY click on the same generation")
     parser.add_argument("--click-serialize", action="store_true",
                         help="hold a global lock across the whole xdotool "
                              "mousemove/down/up sequence. There is ONE X "
@@ -1686,6 +1724,15 @@ async def main() -> int:
         "xdo_ms": spread(xdo_rows, "xdo_ms"),
         "total_ms": spread(stats.clicklat, "total_ms"),
         "serialize": bool(args.click_serialize),
+        "gate": args.click_gate,
+        "clicks_on_minting_generations": stats.clicks_on_token,
+        "clicks_on_dead_generations": stats.clicks - stats.clicks_on_token,
+        "wasted_pct": round(100.0 * (stats.clicks - stats.clicks_on_token)
+                            / stats.clicks, 1) if stats.clicks else -1.0,
+        "clicks_per_token": round(stats.clicks / stats.tokens, 2)
+                            if stats.tokens else -1.0,
+        "clicks_per_escalation": round(stats.clicks / stats.escalations, 2)
+                                 if stats.escalations else -1.0,
         "poll_ms": args.poll_ms,
         "recycle_ms": args.recycle_ms,
     }, sort_keys=True), flush=True)
