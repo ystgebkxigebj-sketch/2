@@ -1,5 +1,5 @@
 name: Gartic Camoufox SELF-HEAL
-run-name: camoufox-selfheal x1 ${{ inputs.minutes }}min verify=${{ inputs.verify_every }}s ladder=${{ inputs.ladder }}
+run-name: camoufox-selfheal ${{ inputs.label_suffix }} lanes=${{ inputs.lanes }} ${{ inputs.minutes }}min verify=${{ inputs.verify_every }}s ladder=${{ inputs.ladder }}
 
 # ===========================================================================
 #  THE SELF-HEALING CAMOUFOX ARM
@@ -138,15 +138,32 @@ on:
         default: "false"
         type: choice
         options: ["false", "true"]
+      label_suffix:
+        description: "Appended to the relay label. REQUIRED to tell concurrent arms apart: WARP IPv4 is anycast and reused, so /stats/exits rows keyed on IP silently merge two runners."
+        required: false
+        default: ""
 
 permissions:
   contents: read
 
-# Same group as gartic-camoufox-click.yml on purpose: only ONE Camoufox run may
-# execute at a time, and these two are the same experiment at different stages.
-# Not removed, not renamed — scaling is an operator decision.
+# PER-RUN UNIQUE, so N runners can coexist.
+#
+# This used to be `group: camoufox-click`, shared with gartic-camoufox-click.yml.
+# With `cancel-in-progress: false` that is a hard cap of ONE concurrent run: a
+# second dispatch does not fail, it silently QUEUES behind the first, which for a
+# 300-minute producer means it never starts. That was correct while this was a
+# single-arm experiment and is exactly wrong for a fleet, where the whole point
+# is many independent runners.
+#
+# `github.run_id` is unique per run, so every run gets its own group and nothing
+# is ever serialised or cancelled. `cancel-in-progress: false` is kept so the
+# semantics stay "never kill a producer", which is what protects a run that is
+# minting from a stray dispatch.
+#
+# gartic-camoufox-click.yml keeps the old `camoufox-click` group and is
+# deliberately untouched — it remains runnable exactly as before.
 concurrency:
-  group: camoufox-click
+  group: camoufox-selfheal-${{ github.run_id }}
   cancel-in-progress: false
 
 jobs:
@@ -355,7 +372,7 @@ jobs:
           secs=$(( ${{ inputs.minutes }} * 60 ))
           python -u 'turnstile-system/token generators/camoufox-fresh/generator_selfheal.py' \
             --out /tmp/tokens.jsonl \
-            --label "cfxheal-${{ inputs.egress }}" \
+            --label "cfxheal-${{ inputs.egress }}${{ inputs.label_suffix && format('-{0}', inputs.label_suffix) || '' }}" \
             --duration "$secs" \
             --lanes '${{ inputs.lanes }}' \
             --appearance '${{ inputs.appearance }}' \
