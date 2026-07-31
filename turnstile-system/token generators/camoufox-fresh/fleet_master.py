@@ -303,7 +303,13 @@ def truthy(raw: str) -> bool:
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--repo", required=True, help="OWNER/REPO")
-    parser.add_argument("--workflow", default="gartic-camoufox-producers.yml")
+    # NOT `gartic-camoufox-producers.yml` any more. That producer has no click
+    # driver, so since Cloudflare made every Turnstile challenge interactive on
+    # 2026-07-27 it has minted zero — greenly, invisibly, while still consuming a
+    # runner slot the supervisor counts as productive. The default therefore
+    # points at the producer that is measured to work; the supervisor workflow
+    # overrides it from the CAMOUFOX_FLEET_WORKFLOW repo variable.
+    parser.add_argument("--workflow", default="gartic-camoufox-fleet.yml")
     parser.add_argument("--branch", default="main")
     parser.add_argument("--tunnel", default="warp", choices=("warp", "vpngate"))
     parser.add_argument("--enabled", default="",
