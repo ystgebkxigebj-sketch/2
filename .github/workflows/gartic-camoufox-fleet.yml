@@ -58,6 +58,15 @@ run-name: ${{ inputs.tunnel }} x${{ inputs.producers }} ${{ inputs.duration }}s 
 # supervisor default is how a tuned fleet quietly stops being the thing that
 # was tested.
 #
+# EVERY RUNNER GETS ITS OWN LABEL (`cfxheal-warp-f<run_number>`). A shared label
+# is unusable at fleet scale: /stats/exits rows key on IP, WARP IPv4 is anycast
+# and reused (measured 2026-07-31: one row carried both `cfxheal-warp-fleet` and
+# `vm-l2`, and one runner posted from three addresses in six minutes), and the
+# self-verification beacon is appended to the LABEL — so N runners sharing one
+# label produce interleaved beacons that cannot be told apart, and a single stuck
+# runner stays invisible inside a healthy average. The run number also maps a
+# label straight back to its Actions run.
+#
 # CHROMIUM (rung 4) IS OFF BY DEFAULT HERE and on in the manual arm. The rung
 # exists to be an in-run control that is expected to be WORSE — valuable in an
 # experiment, pure downside in production, where it would also add ~90 s of
@@ -365,7 +374,7 @@ jobs:
           secs=${{ inputs.duration }}
           python -u 'turnstile-system/token generators/camoufox-fresh/generator_selfheal.py' \
             --out /tmp/tokens.jsonl \
-            --label "cfxheal-${{ inputs.tunnel }}-fleet" \
+            --label "cfxheal-${{ inputs.tunnel }}-f${{ github.run_number }}" \
             --duration "$secs" \
             --lanes '${{ (vars.CAMOUFOX_FLEET_LANES || '2') }}' \
             --appearance '${{ (vars.CAMOUFOX_FLEET_APPEARANCE || 'interaction-only') }}' \
