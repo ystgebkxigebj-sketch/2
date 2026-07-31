@@ -700,15 +700,27 @@ async def run_session(args, stats: Stats, out_handle, deadline: float | None,
             if now >= session_end or (deadline and now >= deadline):
                 return
 
-            # ── LIVE BEACON. GitHub publishes a job's log only when the JOB
-            # ENDS — the REST logs endpoint answers BlobNotFound and `gh run
-            # view --log` refuses outright — so on a 180-minute run every number
-            # this producer prints is invisible for three hours. `::notice::`
-            # writes a check-run annotation, which IS readable while the job
-            # runs (`gh api repos/O/R/check-runs/<job_id>/annotations`). That is
-            # the only live channel out of a runner, and without it the PRIMARY
-            # metric of this experiment — the auto/int solve split — cannot be
-            # read until the run is over.
+            # ── BEACON. GitHub publishes a job's log only when the JOB ENDS:
+            # the REST logs endpoint answers `BlobNotFound` and `gh run view
+            # --log` refuses outright ("logs will be available when it is
+            # complete"). So on a 180-minute run every number this producer
+            # prints is invisible for three hours, and the PRIMARY metric of
+            # this experiment — the auto/int solve split — cannot be read until
+            # it is over.
+            #
+            # ⚠️ MEASURED 2026-07-31: `::notice::` does NOT close that gap.
+            # `GET /repos/O/R/check-runs/<job_id>/annotations` returned `[]`
+            # 22 minutes into a run that had emitted two beacons — annotations
+            # are materialised with the job, like the log. The lines are still
+            # worth emitting (they are a compact, greppable summary in the final
+            # log), but DO NOT plan a run around reading them live.
+            #
+            # What IS live from a runner: whatever the producer POSTs off-box.
+            # Here that is the token stream itself, so the relay's
+            # /stats/exits (minted, mintPerMin, queued) and the roomscore
+            # sampler's jsonl are the only real-time instruments. If a future
+            # run needs a live solve split, ship the counters to the relay —
+            # not to the log, and not to an annotation.
             #
             # Cadence is deliberately slow: GitHub keeps ~10 annotations per
             # level per step, so a chatty beacon would evict its own history.
