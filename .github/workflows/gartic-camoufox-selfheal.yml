@@ -1,0 +1,447 @@
+name: Gartic Camoufox SELF-HEAL
+run-name: camoufox-selfheal x1 ${{ inputs.minutes }}min verify=${{ inputs.verify_every }}s ladder=${{ inputs.ladder }}
+
+# ===========================================================================
+#  THE SELF-HEALING CAMOUFOX ARM
+#  = gartic-camoufox-click.yml (192 accepted / 0 refused, 2026-07-31 01:40-04:49Z)
+#  + a feedback signal the runner owns
+#  + a fingerprint ladder that fires when that signal says acceptance collapsed
+# ===========================================================================
+#
+# WHY A RUNNER HAS TO MEASURE ITSELF
+# ----------------------------------
+# The relay serves production from `SERVE_TRUSTED_LABELS=vm-`, so icebot never
+# redeems a GitHub token and the relay therefore learns nothing about a runner's
+# acceptance — every GitHub exit reads `wJ=0 wR=0` no matter how it is doing. The
+# only alternative is a human running a sampler on another box, which is exactly
+# what is unavailable on hour four of a 300-minute run. So the producer dials
+# gartic itself.
+#
+# THE OLD VERIFIER WAS BLIND FOR FOUR SEPARATE REASONS (all verified 2026-07-31)
+# ------------------------------------------------------------------------------
+# `github-chromium-producer/inputs/joinverify` + the `case "$V" in JOINED*)` line
+# in `workflow.template.yml`:
+#
+#   1. It joined PUBLIC MATCHMAKING (`/server/?…&lang=19` + `42[1,{…,"idioma":19}]`).
+#      Since 2026-07-30 ~22:46Z gartic answers that path with `42["6",1]` for
+#      every language on every exit, INCLUDING a residential control that
+#      specific-room joins accept in the same minute. code 1 is a room-state
+#      rejection that lands BEFORE the token is read.
+#   2. `case "$V" in JOINED*)` is a DENY-LIST. Measured with a live VM token
+#      against a full room: `{"bucket":"ACCEPTED_roomfull","code":"3"}`. The
+#      Turnstile gate runs before the capacity check and before the
+#      already-playing dedup check, so code 3 and code 4 PROVE acceptance — and
+#      that line scored both as refusals. A 100%-accepted arm could read 0%.
+#   3. code 1, Cloudflare 1015 and every dial error went into the DENOMINATOR.
+#   4. Fixed nick `probe`, one un-rotatable target — so gartic's per-(IP,room)
+#      re-join lock (~45-60 s) manufactured code 4, which (2) also lost.
+#
+# `tools/roomverify` fixes all four: specific ROTATING rooms via event 3, random
+# nick, and an ALLOW-LIST (`ACCEPTED_*` / `REFUSED_token` only; every
+# `NOVERDICT_*` is excluded from BOTH halves of the ratio). It also carries its
+# own room roster from gartic's `/req/list`, because the VM's Bird roster is
+# loopback-only and unreachable from CI.
+#
+# WHAT THE LADDER MAY AND MAY NOT CHANGE
+# --------------------------------------
+# Rungs change the BROWSER FINGERPRINT and nothing else. Exit rotation is
+# deliberately absent: a cut is network-wide rather than per-runner, rotating has
+# never once helped, and it would confound the one variable measured to move
+# acceptance — 192/0 for Camoufox against 2/108 and 0/119 for a co-located
+# Chromium on the SAME host, ASN, WARP exit and minutes.
+#
+#   0 baseline     Camoufox v135, random fingerprint
+#   1 fp-regen     relaunch → Camoufox re-rolls the whole fingerprint + profile
+#   2 fp-os-swap   relaunch with a FORCED different OS family, window and
+#                  humanize setting, so the second try cannot land on the first
+#   3 alt-build    a second Camoufox build. SKIPPED unless `alt_build_url` is
+#                  supplied: only v135.0.1-beta.24 is verified to mint on this
+#                  sitekey (v152 gives zero, error 600010), and shipping an
+#                  unpinned build would trade an acceptance problem for an
+#                  issuance one.
+#   4 chromium     Playwright Chromium — the IN-RUN CONTROL, expected to be
+#                  WORSE. A ladder that only ever improves is unfalsifiable.
+#
+# Exhausting the ladder wraps back to rung 1 with a longer dwell, because if the
+# fingerprint is the lever then cycling fingerprints is the right steady state —
+# and if it is one of gartic's global self-healing outages (~18 to ≥60 min) then
+# slowing down is the right response to something no fingerprint can fix.
+#
+# NOTHING HERE SELF-DISPATCHES. No cron. It does not touch
+# CAMOUFOX_FLEET_ENABLED, and its tokens carry a `cfxheal-` label, so the relay's
+# SERVE_TRUSTED_LABELS=vm- keeps production on VM tokens regardless.
+
+on:
+  workflow_dispatch:
+    inputs:
+      minutes:
+        description: Minutes to mint for
+        required: true
+        default: "300"
+      lanes:
+        description: Concurrent Turnstile widgets (each needs 320px of window width)
+        required: true
+        default: "2"
+      appearance:
+        description: Widget mode — interaction-only is what gartic's own client uses; `always` mints zero on datacenter egress
+        required: true
+        default: interaction-only
+        type: choice
+        options: [interaction-only, always]
+      token_interval:
+        description: Seconds a lane waits after a token before re-arming (0 = unthrottled)
+        required: true
+        default: "4"
+      egress:
+        description: warp keeps this on the same network as every previous GitHub arm; none = direct AS8075 (mints 0 — WARP is load-bearing for ISSUANCE)
+        required: true
+        default: warp
+        type: choice
+        options: [warp, none]
+      verify_every:
+        description: Seconds between self-verifications. Each costs ONE token, DIVERTED from the relay (tokens are ~74x oversupplied)
+        required: true
+        default: "45"
+      collapse_threshold:
+        description: Consecutive code-5 that declare a collapse. code 1 / cf1015 never count.
+        required: true
+        default: "5"
+      ladder:
+        description: Escalate the fingerprint ladder on collapse (false = measure only)
+        required: true
+        default: "true"
+        type: choice
+        options: ["true", "false"]
+      chromium_fallback:
+        description: Keep rung 4 (Playwright Chromium) as the in-run control
+        required: true
+        default: "true"
+        type: choice
+        options: ["true", "false"]
+      alt_build_url:
+        description: "RUNG 3 (optional): URL of a second Camoufox linux x86_64 zip. Empty = rung skipped."
+        required: false
+        default: ""
+      alt_build_sha:
+        description: "RUNG 3 (optional): sha256 of alt_build_url. Required if the URL is set."
+        required: false
+        default: ""
+      post_to_relay:
+        description: Feed the live relay (needed to score acceptance via /assign?src= from outside)
+        required: true
+        default: "true"
+        type: choice
+        options: ["true", "false"]
+      log_rects:
+        description: Echo every RECT line (very verbose)
+        required: false
+        default: "false"
+        type: choice
+        options: ["false", "true"]
+
+permissions:
+  contents: read
+
+# Same group as gartic-camoufox-click.yml on purpose: only ONE Camoufox run may
+# execute at a time, and these two are the same experiment at different stages.
+# Not removed, not renamed — scaling is an operator decision.
+concurrency:
+  group: camoufox-click
+  cancel-in-progress: false
+
+jobs:
+  produce:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 350
+    env:
+      PYTHONUNBUFFERED: "1"
+      AUTH_SECRET: ${{ secrets.CAMOUFOX_AUTH_SECRET }}
+      RELAY_URL: ${{ vars.CAMOUFOX_RELAY_URL || 'https://mohanadino.duckdns.org:8443/add' }}
+      SOCKS_PORT: "25344"
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Runner facts (before any tunnel)
+        run: |
+          echo "direct_egress=$(curl -4 -s --max-time 15 https://api.ipify.org || echo unknown)"
+          echo "asn=$(curl -s --max-time 15 https://ipinfo.io/org || echo unknown)"
+
+      - name: Install Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      # xvfb gives Firefox a real X display so it has a real window; xdotool
+      # drives the pointer through XTEST, which arrives as isTrusted=true.
+      # Camoufox is Firefox-based, so there is no CDP and no
+      # Input.dispatchMouseEvent — XTEST or Playwright's own mouse are the only
+      # two ways in, and this producer uses both.
+      - name: Install Firefox runtime libraries + Xvfb + xdotool
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends \
+            libasound2t64 libdbus-glib-1-2 libgbm1 libgtk-3-0 libnss3 \
+            libx11-xcb1 libxcomposite1 libxcursor1 libxdamage1 libxfixes3 \
+            libxi6 libxrandr2 libxrender1 libxss1 libxt6 libxtst6 \
+            fonts-liberation unzip xvfb xdotool
+          xdotool --version
+
+      - name: Cache Camoufox v135 browser
+        id: browser-cache
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/camoufox
+          key: camoufox-135.0.1-beta.24-lin-x86_64-61e1ec455e021720
+
+      # THE VERSION PIN, AND IT IS LOAD-BEARING. `camoufox fetch` installs v152,
+      # which yields ZERO tokens on this sitekey (measured: 70x error 600010).
+      # The exact v135 build is placed by hand and checksummed, and the Python
+      # package is pinned to the 0.4.11 that speaks to it. Never let one of the
+      # two drift: the failure is total and looks like a network problem.
+      - name: Install Camoufox 135.0.1-beta.24
+        if: steps.browser-cache.outputs.cache-hit != 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
+          url='https://github.com/daijro/camoufox/releases/download/v135.0.1-beta.24/camoufox-135.0.1-beta.24-lin.x86_64.zip'
+          expected='61e1ec455e021720af38a5cc5ff7566121363cb5b82b72f24e381ba2676a4888'
+          ok=""
+          for attempt in 1 2 3 4 5 6; do
+            if curl -fL --retry 3 --retry-delay 3 --retry-all-errors -C - \
+                 --connect-timeout 20 -o /tmp/camoufox.zip "$url"; then
+              if echo "$expected  /tmp/camoufox.zip" | sha256sum --check --strict; then ok=1; break; fi
+            fi
+            echo "attempt $attempt failed; backing off"; sleep $(( attempt * 10 ))
+          done
+          if [[ -z "$ok" ]]; then echo "could not download camoufox" >&2; exit 1; fi
+          rm -rf "$HOME/.cache/camoufox"; mkdir -p "$HOME/.cache/camoufox"
+          unzip -q /tmp/camoufox.zip -d "$HOME/.cache/camoufox"
+          printf '%s\n' '{"version":"135.0.1","release":"beta.24"}' > "$HOME/.cache/camoufox/version.json"
+          chmod -R u+rwX,go+rX "$HOME/.cache/camoufox"
+
+      # RUNG 3. Skipped unless the operator supplies BOTH a URL and its sha256:
+      # an unpinned build is an issuance risk, and swapping an acceptance problem
+      # for an issuance one is not a fix. A failure here is not fatal — the rung
+      # simply stays out of the ladder.
+      - name: Fetch the optional alternate Camoufox build (rung 3)
+        if: inputs.alt_build_url != '' && inputs.alt_build_sha != ''
+        continue-on-error: true
+        shell: bash
+        run: |
+          set -euo pipefail
+          curl -fL --retry 3 --retry-all-errors --connect-timeout 20 \
+            -o /tmp/camoufox-alt.zip '${{ inputs.alt_build_url }}'
+          echo '${{ inputs.alt_build_sha }}  /tmp/camoufox-alt.zip' | sha256sum --check --strict
+          mkdir -p "$HOME/.cache/camoufox-alt"
+          unzip -q /tmp/camoufox-alt.zip -d "$HOME/.cache/camoufox-alt"
+          printf '%s\n' '{"version":"alt","release":"alt"}' > "$HOME/.cache/camoufox-alt/version.json"
+          chmod -R u+rwX,go+rX "$HOME/.cache/camoufox-alt"
+          echo "ALT_EXECUTABLE=$HOME/.cache/camoufox-alt/camoufox-bin" >> "$GITHUB_ENV"
+
+      - name: Install pinned Python packages
+        shell: bash
+        run: |
+          set -euo pipefail
+          python -m pip install --disable-pip-version-check \
+            'camoufox[geoip]==0.4.11' 'playwright==1.61.0'
+          python -c 'import camoufox, geoip2, playwright; print("imports=ok")'
+          "$HOME/.cache/camoufox/camoufox-bin" --version
+
+      # RUNG 4's browser. continue-on-error because a missing Chromium must
+      # degrade the ladder by one rung, never kill a 300-minute producer: the
+      # generator catches the launch failure and escalates past it.
+      - name: Install Playwright Chromium (rung 4 control)
+        if: inputs.chromium_fallback == 'true'
+        continue-on-error: true
+        shell: bash
+        run: |
+          set -uo pipefail
+          sudo "$(command -v python)" -m playwright install-deps chromium || true
+          python -m playwright install chromium
+          echo "chromium installed"
+
+      - name: Go toolchain (roomverify needs >= the version in its go.mod)
+        uses: actions/setup-go@v5
+        with:
+          go-version: "stable"
+          cache: false
+
+      - name: Build roomverify
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd tools/roomverify
+          go build -o /tmp/roomverify .
+          echo "built $(ls -l /tmp/roomverify | awk '{print $5}') bytes"
+          # Informational only, and deliberately NOT fatal: gartic's WAF answers
+          # some GitHub runner addresses with a 403 block page, which fails for
+          # reasons that have nothing to do with the verifier. The binding gate
+          # runs after the tunnel is up.
+          /tmp/roomverify -list-rooms 19 | head -3 | sed 's/^/direct_room=/' || \
+            echo "direct roster unavailable (expected on some GitHub addresses)"
+
+      # Same tunnel every previous GitHub arm used, so this stays a browser
+      # experiment on one network rather than a browser-and-network experiment.
+      - name: Bring up Cloudflare WARP
+        if: inputs.egress == 'warp'
+        shell: bash
+        run: |
+          set -euo pipefail
+          chmod +x experiments/egress/warp_up.sh
+          experiments/egress/warp_up.sh "$SOCKS_PORT" | tee /tmp/warp.txt | sed 's/^/warp_/'
+          echo "PROXY=socks5://127.0.0.1:$SOCKS_PORT" >> "$GITHUB_ENV"
+          echo "EXITIP=$(sed -n 's/^exit_v4=//p' /tmp/warp.txt | tail -1)" >> "$GITHUB_ENV"
+          echo "EXITV6=$(sed -n 's/^exit_ip=//p' /tmp/warp.txt | tail -1)" >> "$GITHUB_ENV"
+          echo "COLO=$(sed -n 's/^colo=//p' /tmp/warp.txt | tail -1)" >> "$GITHUB_ENV"
+
+      # ── THE BINDING GATE, on the path the producer will actually use.
+      # A verifier that cannot answer REFUSED_token for an obviously bogus token
+      # is measuring itself, not gartic. A verifier with no room roster has
+      # nothing to dial. Either one leaves a 300-minute run with no acceptance
+      # signal at all — and the allow-list would correctly report `settled=0`
+      # rather than a comforting fake number, which is right but useless. Fail in
+      # 30 seconds instead.
+      - name: Gate — roomverify must work on the producer's own egress
+        shell: bash
+        run: |
+          set -euo pipefail
+          args=(); [ -n "${PROXY:-}" ] && args=(-proxy "$PROXY")
+          echo "--- roster (expect > 0 rooms) ---"
+          /tmp/roomverify "${args[@]}" -list-rooms 19,2,1,0,5 > /tmp/rooms.txt
+          echo "rooms=$(wc -l < /tmp/rooms.txt) via ${PROXY:-direct}"
+          test "$(wc -l < /tmp/rooms.txt)" -gt 0
+          echo "--- bogus token (expect bucket REFUSED_token) ---"
+          /tmp/roomverify "${args[@]}" -room "$(head -1 /tmp/rooms.txt)" \
+            '1.AAAAAAAAAAAA.BBBBBBBB' | tee /tmp/selftest.json
+          grep -q '"bucket":"REFUSED_token"' /tmp/selftest.json
+
+      - name: Start Xvfb
+        shell: bash
+        run: |
+          set -euo pipefail
+          Xvfb :99 -screen 0 1280x1024x24 -nolisten tcp >/tmp/xvfb.log 2>&1 &
+          for _ in $(seq 1 30); do
+            DISPLAY=:99 xdotool getdisplaygeometry >/dev/null 2>&1 && break
+            sleep 1
+          done
+          DISPLAY=:99 xdotool getdisplaygeometry | sed 's/^/display_geometry=/'
+          echo "DISPLAY=:99" >> "$GITHUB_ENV"
+
+      - name: Produce
+        shell: bash
+        run: |
+          set -uo pipefail
+          relay=(); rects=(); ladder=(); chrome=(); alt=()
+          if [[ '${{ inputs.post_to_relay }}' == 'true' ]]; then
+            if [[ -z "${AUTH_SECRET:-}" ]]; then
+              echo "post_to_relay=true but CAMOUFOX_AUTH_SECRET is unset" >&2; exit 1
+            fi
+            relay=(--relay-url "$RELAY_URL")
+            # POST through the tunnel: the relay attributes a token to the TCP
+            # peer it arrived from, so posting on the runner's own egress would
+            # file every WARP-minted token under GitHub's address and make
+            # /assign?src=<exit> score the wrong host entirely.
+            if [[ -n "${PROXY:-}" ]]; then relay+=(--relay-proxy "$PROXY"); fi
+          fi
+          if [[ '${{ inputs.log_rects }}' == 'true' ]]; then rects=(--log-rects); fi
+          if [[ '${{ inputs.ladder }}' != 'true' ]]; then ladder=(--no-ladder); fi
+          if [[ '${{ inputs.chromium_fallback }}' != 'true' ]]; then
+            chrome=(--no-chromium-fallback)
+          fi
+          if [[ -n "${ALT_EXECUTABLE:-}" ]]; then alt=(--alt-executable "$ALT_EXECUTABLE"); fi
+          secs=$(( ${{ inputs.minutes }} * 60 ))
+          python -u 'turnstile-system/token generators/camoufox-fresh/generator_selfheal.py' \
+            --out /tmp/tokens.jsonl \
+            --label "cfxheal-${{ inputs.egress }}" \
+            --duration "$secs" \
+            --lanes '${{ inputs.lanes }}' \
+            --appearance '${{ inputs.appearance }}' \
+            --token-interval '${{ inputs.token_interval }}' \
+            --browser-lifetime 1800 \
+            --reload-interval 0 \
+            --stall-timeout 1500 \
+            --diag-every 60 \
+            --display :99 \
+            --no-headless \
+            --humanize \
+            --window 1280x1000 \
+            --executable "$HOME/.cache/camoufox/camoufox-bin" \
+            --ff-version 135 \
+            --verify-binary /tmp/roomverify \
+            --verify-every '${{ inputs.verify_every }}' \
+            --verify-start-delay 120 \
+            --verify-langs 19,2,1,0,5 \
+            --collapse-threshold '${{ inputs.collapse_threshold }}' \
+            --rung-min-dwell 240 \
+            "${ladder[@]}" "${chrome[@]}" "${alt[@]}" \
+            "${rects[@]}" "${relay[@]}" 2>&1 | tee /tmp/produce.log
+
+      - name: Report
+        if: always()
+        shell: bash
+        run: |
+          tokens=$(wc -l < /tmp/tokens.jsonl 2>/dev/null || echo 0)
+          echo "=================================================="
+          echo " exit_v4=${EXITIP:-direct} exit_v6=${EXITV6:-none} colo=${COLO:-none}"
+          echo " tokens = $tokens over ${{ inputs.minutes }} min"
+          echo "=================================================="
+          # ── ISSUANCE and ACCEPTANCE fail for completely different reasons and
+          # the fix differs entirely, so they are always reported separately.
+          echo "--- ISSUANCE ---"
+          grep -a '^PRODUCER ' /tmp/produce.log 2>/dev/null | tail -1 || \
+            echo 'PRODUCER {"error":"producer emitted no summary"}'
+          python3 - <<'PY' || true
+          import json, collections
+          rows = []
+          try:
+              for line in open('/tmp/tokens.jsonl'):
+                  line = line.strip()
+                  if line:
+                      rows.append(json.loads(line))
+          except OSError:
+              pass
+          if not rows:
+              print("NO TOKENS. Check the [diag] lines: if `escalations` > 0 and "
+                    "`clicks` == 0 the RECT GATE never opened — that is a CLICKER "
+                    "failure, not a Cloudflare verdict, and this run is UNTESTED.")
+          else:
+              c = collections.Counter(r.get('solve', '?') for r in rows)
+              auto, inter = c.get('auto', 0), c.get('int', 0)
+              total = auto + inter
+              print(f"SOLVE PATH  auto={auto}  int={inter}  "
+                    f"auto_pct={100.0*auto/total if total else 0:.1f}%")
+              print(f"diverted to self-verify = "
+                    f"{sum(1 for r in rows if r.get('diverted'))}/{len(rows)}")
+          PY
+          echo "--- ACCEPTANCE (allow-list: ACCEPTED_* and REFUSED_token only) ---"
+          grep -a '^ACCEPTANCE ' /tmp/produce.log 2>/dev/null | tail -1 || \
+            echo 'no ACCEPTANCE line — self-verification never produced a verdict'
+          sed -n '/acceptance by 10-min bin/,/^LADDER-HISTORY\|^$/p' /tmp/produce.log \
+            2>/dev/null | head -40 || true
+          echo "--- LADDER ---"
+          if grep -aq '^LADDER ' /tmp/produce.log 2>/dev/null; then
+            grep -a '^LADDER ' /tmp/produce.log
+          else
+            echo "NO ESCALATION — acceptance never hit ${{ inputs.collapse_threshold }} consecutive code-5."
+            echo "That is a RESULT, not a failure: it says the arm did not meet a cut"
+            echo "(or Camoufox did not experience one) during this window."
+          fi
+          echo "--- last verdicts ---"
+          grep -a '^VERIFY ' /tmp/produce.log 2>/dev/null | tail -12 || true
+          echo "--- click / rect evidence ---"
+          grep -ac 'CLICKAT' /tmp/produce.log 2>/dev/null | sed 's/^/clickat_lines=/' || true
+          grep -a '\[diag\]' /tmp/produce.log 2>/dev/null | tail -5 || true
+
+      - name: Upload raw log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: camoufox-selfheal-log
+          path: |
+            /tmp/produce.log
+            /tmp/tokens.jsonl
+          if-no-files-found: warn
+          retention-days: 7
