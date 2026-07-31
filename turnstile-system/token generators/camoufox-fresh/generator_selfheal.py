@@ -133,6 +133,28 @@ RENDERER_JS = r"""
         ' dpr=' + (window.devicePixelRatio || 1));
   }
 
+  // ── LANE LAYOUT IS A GRID, NOT A ROW, AND THAT IS LOAD-BEARING ────────────
+  // Each widget needs ~320px of width. The original layout put lane i at
+  // left = 20 + i*320 on a single row, so on the standard 1280px window lane 4
+  // landed at left=1300 — entirely outside the viewport. An off-screen widget
+  // never lays out, its rect stays 0x0, the rect gate never opens and the
+  // xdotool clicker never fires: Cloudflare then times out with err 300030 and
+  // the arm mints ZERO. That is precisely the failure that produced the false
+  // "Camoufox cannot mint on any IP" conclusion, and a single-row layout brings
+  // it back the instant anyone raises --lanes past 3. Wrapping into rows keeps
+  // every lane on screen at the SAME window size, which matters because the
+  // window is part of the fingerprint and the fingerprint is what decides
+  // acceptance — widening the window to fit more lanes would change the very
+  // variable under test.
+  //
+  // For lanes <= 3 on a 1280px window this is byte-identical to the old layout
+  // (cols() == 3, so col == i and row == 0), so the proven 2-lane behaviour is
+  // untouched.
+  var CELL_W = 320, CELL_H = 90, SLOT_W = 300, SLOT_H = 70, PAD = 20;
+  function cols() {
+    return Math.max(1, Math.floor((window.innerWidth - PAD) / CELL_W));
+  }
+
   // Union of the slot's own rect and every descendant's. Cloudflare sometimes
   // keeps the container collapsed and renders the interactive challenge into a
   // child that is positioned over it; taking the union means the rect gate sees
@@ -167,11 +189,22 @@ RENDERER_JS = r"""
       // by rect and does not need it; it costs one line and keeps any future
       // off-the-shelf clicker able to locate us.
       slot.className = 'cf-turnstile';
-      // Fixed at the TOP-left: a window shorter than expected still shows it,
-      // whereas a bottom-anchored widget can land below the visible area and
-      // then no pointer on earth can reach it.
-      slot.style.cssText = 'position:fixed;left:' + (20 + i * 320) +
-                           'px;top:20px;width:300px;height:70px;z-index:2147483647';
+      // Fixed and anchored to the TOP-left, filling rightwards then downwards:
+      // a window shorter or narrower than expected still shows the early lanes,
+      // whereas a bottom- or right-anchored widget can land outside the visible
+      // area and then no pointer on earth can reach it.
+      var c = cols();
+      var col = i % c, row = Math.floor(i / c);
+      var left = PAD + col * CELL_W, top = PAD + row * CELL_H;
+      // Loud, not silent. A lane that cannot fit is a lane that will mint
+      // nothing while every counter still looks healthy, so say so once per
+      // build rather than letting it read as a Cloudflare refusal.
+      if (top + SLOT_H > window.innerHeight) {
+        log('E:lane_offscreen lane=' + i + ' top=' + top + ' ih=' + window.innerHeight);
+      }
+      slot.style.cssText = 'position:fixed;left:' + left + 'px;top:' + top +
+                           'px;width:' + SLOT_W + 'px;height:' + SLOT_H +
+                           'px;z-index:2147483647';
       host.appendChild(slot);
       try {
         id = window.turnstile.render(slot, {
