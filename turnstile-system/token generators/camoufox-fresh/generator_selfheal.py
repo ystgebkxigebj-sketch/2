@@ -119,6 +119,8 @@ RENDERER_JS = r"""
   var RESET_MS = __RESET_DELAY_MS__;
   var CLICK_MIN_W = __CLICK_MIN_W__;
   var CLICK_MIN_H = __CLICK_MIN_H__;
+  var CLICK_GATE = '__CLICK_GATE__';   // rect | escalation | both
+  var REARM_MS = __CLICK_REARM_MS__;   // retry spacing, non-rect gates only
 
   function log(s) { try { console.log(s); } catch (e) {} }
 
@@ -177,11 +179,15 @@ RENDERER_JS = r"""
   function lane(i) {
     var gen = 0, id = null, slot = null, sawInter = false, emitted = false;
     var lastW = -1, lastH = -1, ticks = 0;
+    // CLICK GATE state. `wantClick` is set by before-interactive-callback and
+    // is the only thing that opens a non-rect gate; `lastArm` spaces retries.
+    var wantClick = false, lastArm = 0, nClickAt = 0;
 
     function build() {
       gen++;
       var myGen = gen;
       sawInter = false; emitted = false; lastW = -1; lastH = -1; ticks = 0;
+      wantClick = false; lastArm = 0; nClickAt = 0;
       if (slot && slot.parentNode) slot.parentNode.removeChild(slot);
       slot = document.createElement('div');
       slot.id = 'lane_' + i + '_' + myGen;
@@ -217,7 +223,10 @@ RENDERER_JS = r"""
           'expired-callback': function () { defer(myGen, 0); },
           'timeout-callback': function () { log('E:timeout'); defer(myGen, 0); },
           'before-interactive-callback': function () {
-            sawInter = true; log('INTER lane=' + i + ' gen=' + myGen);
+            // THIS is the "a click is wanted, now" signal. Cloudflare calls it
+            // exactly when it escalates a widget to interactive.
+            sawInter = true; wantClick = true;
+            log('INTER lane=' + i + ' gen=' + myGen);
           },
           'after-interactive-callback': function () {
             log('AFTERINT lane=' + i + ' gen=' + myGen);
@@ -256,9 +265,44 @@ RENDERER_JS = r"""
               ' inter=' + (sawInter ? 1 : 0));
           lastW = w; lastH = h;
         }
-        // THE RECT GATE. Never `if (iframe)` — an escalated interaction-only
-        // widget exposes no iframe, which is exactly the bug this file fixes.
-        if (w >= CLICK_MIN_W && h >= CLICK_MIN_H) {
+        // ── THE CLICK GATE ──────────────────────────────────────────────
+        // Never `if (iframe)` — an escalated interaction-only widget exposes
+        // no iframe, which is exactly the bug this file was written to fix.
+        // Which signal opens the gate is `--click-gate`:
+        //
+        //   rect       the historical behaviour, and a NO-OP. `slot` is a FIXED
+        //              300x70 div, so unionRect(slot) is >= 300x70 from the
+        //              instant it is appended — before render() has drawn
+        //              anything and before Cloudflare has decided whether to
+        //              escalate. Measured on the probe: the gate opens 5 ms
+        //              after build() while before-interactive-callback fires at
+        //              1481-2225 ms, so every widget is clicked ~1.5 s BEFORE a
+        //              click is wanted, and again every --click-interval after.
+        //   escalation before-interactive-callback fired, and only then. One
+        //              click per escalation, REARM_MS the only retry.
+        //   both       escalated AND laid out.
+        //
+        // Why it matters: across four rect-gate probe arms `cf_errors.timeout`
+        // equalled the DEAD-GENERATION count exactly (12/12, 10/10, 46/46,
+        // 9/9), a dead generation costs 122 s (Cloudflare's interactive
+        // timeout), and dead generations ate 40.6% of all lane-time. Gating on
+        // escalation instead measured 9.33 vs 6.66 tok/min (+40%) with
+        // cf_errors.timeout = 0 and acceptance unchanged at 100%.
+        var rectOK = (w >= CLICK_MIN_W && h >= CLICK_MIN_H);
+        var fire = (CLICK_GATE === 'rect') ? rectOK
+                 : (CLICK_GATE === 'escalation') ? wantClick
+                 : (wantClick && rectOK);
+        if (fire && CLICK_GATE !== 'rect') {
+          // Re-arm, never spray: a click that has not been answered yet is not
+          // evidence that another click is wanted, and clicking a challenge
+          // that is mid-verification is how a solve gets thrown away and is
+          // reported back to us as cf_errors.timeout.
+          var tn = Date.now();
+          if (nClickAt > 0 && (tn - lastArm) < REARM_MS) fire = false;
+          else lastArm = tn;
+        }
+        if (fire) {
+          nClickAt++;
           // The checkbox sits at the left end of a full-width widget; on a
           // small box aim at its centre instead.
           var ox = w >= 200 ? 30 : Math.round(w / 2);
@@ -320,6 +364,8 @@ def build_renderer(args) -> str:
         .replace("__RESET_DELAY_MS__", str(int(args.token_interval * 1000)))
         .replace("__CLICK_MIN_W__", str(args.click_min_w))
         .replace("__CLICK_MIN_H__", str(args.click_min_h))
+        .replace("__CLICK_GATE__", args.click_gate)
+        .replace("__CLICK_REARM_MS__", str(int(args.click_rearm_ms)))
     )
 
 
@@ -488,6 +534,10 @@ class Stats:
         self.clicks_xdo = 0
         self.clicks_mouse = 0
         self.solved_after_click = 0
+        # Clicks spent on generations that DID mint. Everything else was spent
+        # on a generation that died — which is the cost the escalation gate
+        # exists to remove, and it is invisible in any token-keyed metric.
+        self.clicks_on_token = 0
         self.errors: dict[str, int] = {}
         self.rect_max: dict[int, tuple[int, int]] = {}
         self.escalations = 0
@@ -1083,6 +1133,7 @@ async def run_session(args, stats: Stats, out_handle, deadline: float | None,
                     stats.auto += 1
                 else:
                     stats.inter += 1
+                stats.clicks_on_token += clicked
                 if clicked:
                     stats.solved_after_click += 1
                 # DIVERT, never duplicate. A token is single-use: posting it to
@@ -1334,6 +1385,22 @@ async def main() -> int:
                              "Playwright's page.mouse")
     parser.add_argument("--click-max", type=int, default=8,
                         help="clicks per widget generation before giving up")
+    parser.add_argument("--click-gate",
+                        choices=("rect", "escalation", "both"), default="rect",
+                        help="WHAT OPENS THE CLICK GATE. rect (default) is the "
+                             "historical behaviour and a NO-OP — the slot is a "
+                             "fixed 300x70 div, so the gate is open from "
+                             "creation and the clicker fires ~1.5 s before "
+                             "Cloudflare escalates, every --click-interval. "
+                             "escalation clicks when "
+                             "before-interactive-callback fires, the real "
+                             "signal (measured +40% rate, cf_errors.timeout "
+                             "12 -> 0). both = escalated AND laid out. The "
+                             "default stays `rect` so uploading this file "
+                             "changes nothing on its own.")
+    parser.add_argument("--click-rearm-ms", type=int, default=8000,
+                        help="non-rect gates: how long to wait before a RETRY "
+                             "click on the same widget generation")
     parser.add_argument("--click-min-w", type=int, default=20)
     parser.add_argument("--click-min-h", type=int, default=20)
     parser.add_argument("--display", default=os.environ.get("DISPLAY", ""),
@@ -1511,6 +1578,18 @@ async def main() -> int:
             "clicks_xdotool": stats.clicks_xdo,
             "clicks_mouse": stats.clicks_mouse,
             "solved_after_click": stats.solved_after_click,
+            # ── CLICK WASTE. The rect gate's whole cost shows up here: clicks
+            # landing on generations that never minted, each one able to throw
+            # away a solve and come back as cf_errors.timeout.
+            "click_gate": args.click_gate,
+            "clicks_on_minting_generations": stats.clicks_on_token,
+            "clicks_on_dead_generations": stats.clicks - stats.clicks_on_token,
+            "clicks_wasted_pct": round(100.0 * (stats.clicks - stats.clicks_on_token)
+                                       / stats.clicks, 1) if stats.clicks else -1.0,
+            "clicks_per_token": round(stats.clicks / stats.tokens, 2)
+                                if stats.tokens else -1.0,
+            "clicks_per_escalation": round(stats.clicks / stats.escalations, 2)
+                                     if stats.escalations else -1.0,
             "escalations": stats.escalations,
             "max_rect": {str(k): f"{w}x{h}" for k, (w, h) in stats.rect_max.items()},
             "elapsed_s": round(elapsed, 1),
