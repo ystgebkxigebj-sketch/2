@@ -74,6 +74,10 @@ on:
         description: Pause between turnstile.remove() and the next render(). 400 is stock.
         required: false
         default: "400"
+      click_interval:
+        description: Minimum seconds between two clicks on the SAME lane. 3.0 is stock. It only binds once token_interval is small — at ti=4 a lane has always been idle longer than this, at ti=0 it becomes the cycle's largest single term.
+        required: false
+        default: "3.0"
       appearance:
         description: interaction-only (stock) or always. NOTE — `always` mints ZERO on this sitekey; do not use it.
         required: false
@@ -296,6 +300,7 @@ jobs:
             --token-interval '${{ inputs.token_interval }}' \
             --poll-ms '${{ inputs.poll_ms }}' \
             --rebuild-ms '${{ inputs.rebuild_ms }}' \
+            --click-interval '${{ inputs.click_interval }}' \
             --browser-lifetime 100000 \
             --reload-interval 0 \
             --stall-timeout 1500 \
