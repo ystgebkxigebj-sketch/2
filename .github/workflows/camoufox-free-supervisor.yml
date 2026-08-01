@@ -37,6 +37,35 @@ run-name: supervisor (target=${{ vars.CAMOUFOX_FLEET_TARGET }} enabled=${{ vars.
 #  TO RESIZE: set CAMOUFOX_FLEET_TARGET. No commit, no redeploy.
 #
 # ============================================================================
+#  MINTING LIVENESS — a runner that produces nothing must stop counting
+# ============================================================================
+#
+#  GitHub reports a wedged producer as a healthy `in_progress` job. Measured
+#  2026-08-01: run 30700078405 (`f51`) posted tokens for 21 minutes and then
+#  nothing for four hours, counted the whole time toward both `alive` and
+#  `productive` — and since `hard_cap` is measured against `alive`, it also
+#  SUPPRESSED the replacement that would have compensated for it.
+#
+#  So the supervisor now scores each runner on the relay's own record of who
+#  minted (see assess_minting in fleet_master.py) and drops a silent one out of
+#  `productive`. It is OFF unless the secret below exists, and every ambiguity
+#  resolves to "do nothing":
+#
+#    gh secret set RELAY_STATS_AUTH -R ystgebkxigebj-sketch/2 -b '<relay X-Auth>'
+#
+#  Knobs, all optional repo variables:
+#    CAMOUFOX_FLEET_STALL_SECONDS   silence that counts as stalled (default 2700)
+#    CAMOUFOX_FLEET_STALL_STARTUP   grace after the Produce step starts (900)
+#    CAMOUFOX_FLEET_STALL_CANCEL    stalled runs to CANCEL per cycle (default 0 =
+#                                   never; downgrading is the normal remedy, and
+#                                   cancelling destroys the run's end-of-run
+#                                   summary — our only post-hoc diagnostic)
+#    CAMOUFOX_FLEET_EXITS_URL       override the relay endpoint
+#
+#  TO DISABLE ENTIRELY: delete the RELAY_STATS_AUTH secret. The next tick reads
+#  an empty credential, skips the check, and behaves exactly as it did before.
+#
+# ============================================================================
 #
 # Why a supervisor at all, rather than a producer that dispatches its own
 # successor: a dying run's `if: always()` successor dispatch respawns faster
@@ -95,8 +124,34 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      - name: Make the ledger directory
+        run: mkdir -p .fleet-state
+
+      # ── THE LIVENESS LEDGER.  One JSON file: {run id -> when that run was
+      # last KNOWN to be minting}.  It exists because a producer that stops
+      # minting disappears from /stats/exits within minutes — WARP hands its
+      # address to another producer and the relay wipes the row — so absence is
+      # the signal, and absence carries no clock.  This is the clock.
+      #
+      # Losing it is harmless by construction: every run then re-anchors to the
+      # start of its own Produce step, so nothing can be judged for one full
+      # --stall-seconds.  `restore-keys` picks up the newest surviving entry, and
+      # the key is unique per run because cache entries are immutable.
+      - name: Restore the minting-liveness ledger
+        uses: actions/cache/restore@v4
+        with:
+          path: .fleet-state
+          key: camoufox-mint-liveness-${{ github.run_id }}
+          restore-keys: camoufox-mint-liveness-
+
       - name: Reconcile the WARP fleet
         shell: bash
+        env:
+          # Empty unless the operator has set the secret, and an empty value
+          # switches the minting check OFF and restores this supervisor's
+          # previous behaviour exactly. Same secret the producers already hold.
+          #   gh secret set RELAY_STATS_AUTH -R <repo> -b '<X-Auth>'
+          RELAY_AUTH: ${{ secrets.RELAY_STATS_AUTH }}
         run: |
           set -euo pipefail
           dry=""
@@ -137,7 +192,24 @@ jobs:
             --post-to-relay "${{ vars.CAMOUFOX_FLEET_RELAY || 'true' }}" \
             --max-dispatch-per-cycle "${{ vars.CAMOUFOX_FLEET_RAMP || '4' }}" \
             --max-cancel-per-cycle "${{ vars.CAMOUFOX_FLEET_SHRINK || '0' }}" \
+            --relay-exits-url "${{ vars.CAMOUFOX_FLEET_EXITS_URL || 'https://mohanadino.duckdns.org:8443/stats/exits' }}" \
+            --state-file .fleet-state/mint-liveness.json \
+            --stall-seconds "${{ vars.CAMOUFOX_FLEET_STALL_SECONDS || '2700' }}" \
+            --stall-startup-seconds "${{ vars.CAMOUFOX_FLEET_STALL_STARTUP || '900' }}" \
+            --max-stall-cancel-per-cycle "${{ vars.CAMOUFOX_FLEET_STALL_CANCEL || '0' }}" \
             $dry
+
+      # Written even when the reconcile step fails, so a crash mid-cycle cannot
+      # throw away the clock and hand every runner a fresh --stall-seconds of
+      # immunity. A cancelled tick (concurrency: cancel-in-progress) skips this;
+      # the next tick then restores an older entry, which is safe — any sighting
+      # overwrites a stale value, so only genuinely absent runners carry it on.
+      - name: Save the minting-liveness ledger
+        if: always()
+        uses: actions/cache/save@v4
+        with:
+          path: .fleet-state
+          key: camoufox-mint-liveness-${{ github.run_id }}
 
       - name: Relay standing depth
         if: always()
