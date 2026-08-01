@@ -370,9 +370,12 @@ class TestMintingLiveness:
         assert self.assess(runs, self.healthy([50])).verdict[gh_run(60).id] == "starting"
 
     def test_no_snapshot_means_no_opinion(self):
+        """And the per-run report must not read like a verdict either — an
+        instrument that was never consulted has to say so."""
         runs = [gh_run(n) for n in (50, 51)]
         check = self.assess(runs, None)
         assert check.stalled == set() and "not evaluated" in check.note
+        assert set(check.verdict.values()) == {"unknown:no-snapshot"}
 
     def test_unattributable_fleet_abstains(self):
         """If the label contract changes, every runner looks dead. Acting then
