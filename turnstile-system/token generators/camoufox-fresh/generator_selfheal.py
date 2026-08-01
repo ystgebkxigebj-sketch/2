@@ -402,6 +402,78 @@ def parse_proxy(raw: str) -> dict:
 # ---------------------------------------------------------------------------
 # X11 click driver
 # ---------------------------------------------------------------------------
+# CLICK COST PROFILES.
+#
+# The click is ~620 ms of wall time and ~92% of that is DELIBERATE SLEEP, not
+# I/O: 16 waypoints x ~19 ms of inter-step pause + ~160 ms settle + ~100 ms hold.
+# Note what it is NOT — the waypoints are already chained into ONE `xdotool`
+# invocation (one process, one X connection), so "spawn a helper that holds a
+# persistent X connection" cannot recover the 620 ms; at most it recovers the
+# two EXTRA spawns that `mousedown`/`mouseup` cost.
+#
+# THE ACTUAL DEFECT, measured 2026-08-01 and much larger than the sleep budget.
+# `xdotool mousemove --sync X Y` waits for a MotionNotify. A move to the position
+# the pointer is ALREADY at generates none, so it blocks — until some OTHER
+# thread moves the pointer, or the 25 s subprocess timeout. A cubic ease crawls
+# sub-pixel at both ends, so consecutive waypoints round to the same integer
+# constantly. Measured on the live VM lanes over 14,383 real clicks: p50 743 ms
+# but 27-28% >= 1 s and 13-16% >= 5 s, p90 6.0-8.4 s, MEAN 2.0-2.2 s — i.e.
+# 0.46-0.51 clicks/s, not the 1.6/s the p50 implies. It self-limits around 8.5 s
+# rather than the timeout because a SIBLING LANE's motion releases the block,
+# which is why a single lane is the worst case and why p50-based readings missed
+# it entirely: the whole pathology lives in the tail.
+#
+# The three levers that are genuinely free (identical pointer positions,
+# identical programmed timing, so an identical trace reaches Cloudflare):
+#   * `dedupe` — skip a mousemove whose INTEGER position equals the previous
+#                one, keeping its dwell. The page cannot observe a zero-length
+#                move, so nothing is lost; only the impossible wait goes.
+#   * `sync`   — drop `--sync` outright. The X server still processes the
+#                motions in order at the same wall-clock times; only our
+#                confirmation wait goes away.
+#   * `batch`  — fold mousedown/hold/mouseup into the same invocation via
+#                `xdotool click --delay <hold> 1`: 3 spawns -> 1. Worth ~35 ms,
+#                and it shrinks the window in which another lane can move the
+#                pointer between our final move and our mousedown.
+# Everything below those DEGRADES THE MOTION and is a stealth trade-off, not a
+# free saving. Measure acceptance, never rate alone.
+#
+# `base` is exactly the behaviour that shipped, so an unflagged run is unchanged.
+CLICK_PROFILES: dict[str, dict] = {
+    # the control: 12-20 waypoints, --sync on every one, 3 process spawns
+    "base": dict(waypoints=(12, 20), step_ms=(8, 30), settle_ms=(90, 230),
+                 hold_ms=(60, 140), approach_px=(80, 220), sync=True, batch=False,
+                 dedupe=False),
+    # THE CONSERVATIVE FIX. Byte-for-byte `base` — same --sync, same three
+    # spawns, same everything — except that a mousemove to the pixel the pointer
+    # already occupies is dropped and its dwell kept. Smallest possible diff from
+    # production, and it retains the synchronisation semantics.
+    "dedupe": dict(waypoints=(12, 20), step_ms=(8, 30), settle_ms=(90, 230),
+                   hold_ms=(60, 140), approach_px=(80, 220), sync=True, batch=False,
+                   dedupe=True),
+    # IMPLEMENTATION-ONLY, the other way: no XSync at all, one spawn. Same
+    # waypoint count, same jitter, same sleeps, same approach geometry.
+    "impl": dict(waypoints=(12, 20), step_ms=(8, 30), settle_ms=(90, 230),
+                 hold_ms=(60, 140), approach_px=(80, 220), sync=False, batch=True,
+                 dedupe=False),
+    # (A `batch` profile — --sync kept, 3 spawns folded into 1 — was measured and
+    # REMOVED. Batching is worth ~35 ms, it is not the mechanism, and because it
+    # keeps --sync it still emits ~0.3 zero-length moves per click: it looks like
+    # a fix and is not one. check_click_profiles.py now fails any profile that
+    # keeps --sync without deduping, so it cannot come back by accident.)
+    # DEGRADED MOTION, mild: a third of the waypoints, a third of the dwell.
+    "fast": dict(waypoints=(5, 8), step_ms=(4, 12), settle_ms=(45, 90),
+                 hold_ms=(40, 80), approach_px=(60, 160), sync=False, batch=True,
+                 dedupe=False),
+    # DEGRADED MOTION, extreme: no approach at all — the pointer teleports to
+    # the target, settles briefly and clicks. This is the cheapest click that is
+    # still a click, and the one most likely to cost acceptance.
+    "min": dict(waypoints=(0, 0), step_ms=(0, 0), settle_ms=(20, 40),
+                hold_ms=(30, 50), approach_px=(0, 0), sync=False, batch=True,
+                dedupe=False),
+}
+
+
 class XdoDriver:
     """Click through XTEST, addressing the browser window found on $DISPLAY.
 
@@ -411,12 +483,19 @@ class XdoDriver:
     log line still looks healthy.
     """
 
-    def __init__(self, display: str) -> None:
+    def __init__(self, display: str, profile: str = "base") -> None:
         self.display = display
         self.available = bool(shutil.which("xdotool")) and bool(display)
         self.win: tuple[int, int, int, int] | None = None   # x, y, w, h
         self.win_at = 0.0
         self.fail = 0
+        self.profile_name = profile
+        self.profile = CLICK_PROFILES[profile]
+        # Per-click cost breakdown, refreshed by click(). `prog_ms` is the time
+        # we ASKED for (the humanisation sleeps); the gap between it and the
+        # measured wall time is everything X and the process table cost us, and
+        # it is the only part a better implementation can ever recover.
+        self.last: dict = {}
 
     def _run(self, *cmd: str, timeout: float = 10.0) -> str:
         env = dict(os.environ, DISPLAY=self.display)
@@ -486,33 +565,81 @@ class XdoDriver:
         return sx, sy
 
     def click(self, sx: int, sy: int) -> bool:
-        """Approach from a random angle, ease in, overshoot, correct, hold."""
+        """Approach from a random angle, ease in, overshoot, correct, hold.
+
+        Shape and cost come from the active CLICK_PROFILES entry; `base`
+        reproduces the historical sequence exactly.
+        """
         if not self.available:
             return False
+        prof = self.profile
         try:
             steps: list[str] = []
-            ang = random.uniform(0, 6.283)
-            dist = random.uniform(80, 220)
-            ox = sx + dist * math.cos(ang)
-            oy = sy + dist * math.sin(ang)
-            ox = min(max(ox, 5), 4000)
-            oy = min(max(oy, 5), 4000)
-            n = random.randint(12, 20)
-            tx = sx + random.uniform(-4, 4)
-            ty = sy + random.uniform(-3, 3)
-            for i in range(1, n + 1):
-                t = i / n
-                e = 4 * t * t * t if t < 0.5 else 1 - ((-2 * t + 2) ** 3) / 2
-                steps += ["mousemove", "--sync",
-                          str(int(ox + (tx - ox) * e + random.uniform(-1.2, 1.2))),
-                          str(int(oy + (ty - oy) * e + random.uniform(-1.2, 1.2))),
-                          "sleep", f"{random.uniform(0.008, 0.03):.3f}"]
-            steps += ["mousemove", "--sync", str(sx), str(sy),
-                      "sleep", f"{random.uniform(0.09, 0.23):.3f}"]
-            self._run("xdotool", *steps, timeout=25)
-            self._run("xdotool", "mousedown", "1", timeout=5)
-            time.sleep(random.uniform(0.06, 0.14))
-            self._run("xdotool", "mouseup", "1", timeout=5)
+            move = ["mousemove", "--sync"] if prof["sync"] else ["mousemove"]
+            prog = 0.0                       # seconds of sleep we asked for
+            dedupe = prof.get("dedupe", False)
+            last_pt: tuple[int, int] | None = None
+            skipped = 0
+            lo_n, hi_n = prof["waypoints"]
+            n = random.randint(lo_n, hi_n) if hi_n > 0 else 0
+            if n > 0:
+                ang = random.uniform(0, 6.283)
+                dist = random.uniform(*prof["approach_px"])
+                ox = sx + dist * math.cos(ang)
+                oy = sy + dist * math.sin(ang)
+                ox = min(max(ox, 5), 4000)
+                oy = min(max(oy, 5), 4000)
+                tx = sx + random.uniform(-4, 4)
+                ty = sy + random.uniform(-3, 3)
+                step_lo, step_hi = prof["step_ms"]
+                for i in range(1, n + 1):
+                    t = i / n
+                    e = 4 * t * t * t if t < 0.5 else 1 - ((-2 * t + 2) ** 3) / 2
+                    pause = random.uniform(step_lo, step_hi) / 1000.0
+                    prog += pause
+                    px = int(ox + (tx - ox) * e + random.uniform(-1.2, 1.2))
+                    py = int(oy + (ty - oy) * e + random.uniform(-1.2, 1.2))
+                    if dedupe and last_pt == (px, py):
+                        # A move to the pixel the pointer already occupies is
+                        # invisible to the page and impossible for --sync to
+                        # observe. Keep the DWELL, drop the dead request.
+                        steps += ["sleep", f"{pause:.3f}"]
+                        skipped += 1
+                        continue
+                    last_pt = (px, py)
+                    steps += move + [str(px), str(py), "sleep", f"{pause:.3f}"]
+            settle = random.uniform(*prof["settle_ms"]) / 1000.0
+            prog += settle
+            if dedupe and last_pt == (sx, sy):
+                steps += ["sleep", f"{settle:.3f}"]
+                skipped += 1
+            else:
+                steps += move + [str(sx), str(sy), "sleep", f"{settle:.3f}"]
+            hold = random.uniform(*prof["hold_ms"]) / 1000.0
+            prog += hold
+            started = time.monotonic()
+            if prof["batch"]:
+                # ONE process, one X connection, mousedown/hold/mouseup included.
+                steps += ["click", "--delay", str(max(1, int(round(hold * 1000)))), "1"]
+                self._run("xdotool", *steps, timeout=25)
+                spawns = 1
+            else:
+                self._run("xdotool", *steps, timeout=25)
+                self._run("xdotool", "mousedown", "1", timeout=5)
+                time.sleep(hold)
+                self._run("xdotool", "mouseup", "1", timeout=5)
+                spawns = 3
+            self.last = {
+                "prof": self.profile_name,
+                "prog_ms": round(prog * 1000, 1),
+                "wall_ms": round((time.monotonic() - started) * 1000, 1),
+                "wp": n,
+                "spawns": spawns,
+                # Zero-length moves dropped. On `base` this is the count that
+                # WOULD have stalled; anything above 0 is a click production is
+                # currently paying up to 25 s for.
+                "nodup": skipped,
+            }
             self.fail = 0
             return True
         except Exception as error:  # noqa: BLE001
@@ -1401,6 +1528,15 @@ async def main() -> int:
     parser.add_argument("--click-rearm-ms", type=int, default=8000,
                         help="non-rect gates: how long to wait before a RETRY "
                              "click on the same widget generation")
+    parser.add_argument("--click-profile",
+                        choices=tuple(CLICK_PROFILES), default="base",
+                        help="HOW EXPENSIVE THE CLICK IS. `base` (default) is "
+                             "the shipped 16-waypoint humanised motion, ~620 ms, "
+                             "~92%% of it deliberate sleep. `impl`/`batch` keep "
+                             "the pointer trace byte-identical and only remove "
+                             "process spawns and XSync round-trips. `fast` and "
+                             "`min` DEGRADE THE MOTION and are a stealth "
+                             "trade-off: score acceptance, never rate alone.")
     parser.add_argument("--click-min-w", type=int, default=20)
     parser.add_argument("--click-min-h", type=int, default=20)
     parser.add_argument("--display", default=os.environ.get("DISPLAY", ""),
@@ -1492,7 +1628,7 @@ async def main() -> int:
     args.out.parent.mkdir(parents=True, exist_ok=True)
     stats = Stats()
     deadline = time.monotonic() + args.duration if args.duration else None
-    xdo = XdoDriver(args.display)
+    xdo = XdoDriver(args.display, profile=args.click_profile)
 
     ladder = Ladder(args)
     verifier = None
@@ -1522,6 +1658,7 @@ async def main() -> int:
         f"appearance={args.appearance} humanize={args.humanize} "
         f"headless={args.headless} display={args.display or 'none'} "
         f"xdotool={'yes' if xdo.available else 'NO — page.mouse only'} "
+        f"click_profile={args.click_profile} "
         f"lifetime={args.browser_lifetime}s stall={args.stall_timeout}s "
         f"reload={args.reload_interval}s ff={args.ff_version} "
         f"proxy={'yes' if os.environ.get('PROXY', '').strip() else 'direct'} "
@@ -1582,6 +1719,7 @@ async def main() -> int:
             # landing on generations that never minted, each one able to throw
             # away a solve and come back as cf_errors.timeout.
             "click_gate": args.click_gate,
+            "click_profile": args.click_profile,
             "clicks_on_minting_generations": stats.clicks_on_token,
             "clicks_on_dead_generations": stats.clicks - stats.clicks_on_token,
             "clicks_wasted_pct": round(100.0 * (stats.clicks - stats.clicks_on_token)
