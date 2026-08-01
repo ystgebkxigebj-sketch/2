@@ -21,13 +21,38 @@ cannot mint on any IP".
 
 THE FIX, AND THE RULE IT ENCODES
 --------------------------------
-**Gate the click on the widget's BOUNDING RECT, never on iframe presence.** A
-non-interactive Turnstile widget in `interaction-only` mode occupies `0x0`. When
-Cloudflare escalates it, the container grows to roughly `300x68` — that
-transition is the *only* reliable signal that a click is wanted, and it is
-observable without touching Cloudflare's DOM. The rect of every lane is logged
-on every transition and on a heartbeat, so a zero-mint run says where it stopped
-instead of being mysterious.
+**Never gate the click on iframe presence.** A non-interactive Turnstile widget
+in `interaction-only` mode exposes no iframe at all, so an iframe gate can never
+fire — that false negative is what produced the (now corrected) memory "Camoufox
+cannot mint on any IP". The rect of every lane is logged on every transition and
+on a heartbeat, so a zero-mint run says where it stopped instead of being
+mysterious.
+
+⚠️ 2026-07-31 — THE RECT GATE IS A NO-OP, AND WORSE THAN NOTHING. USE
+`--click-gate escalation`.
+------------------------------------------------------------------------
+The rect gate was supposed to be that trigger. It is not one. `slot` is created
+as a **fixed 300x70 div**, so `unionRect(slot)` clears `w>=20 && h>=20` from the
+instant it is appended — the gate opens **~5 ms after build()** while Cloudflare
+escalates (`before-interactive-callback`) at **1,481-2,225 ms**. The clicker
+therefore fires blind, ~1.5 s BEFORE the challenge asks for interaction, and
+then again every 3 s.
+
+Those premature clicks **destroy the widget**. Across 9 instrumented arms,
+`cf_errors.timeout` equalled the dead-generation count EXACTLY in all four
+rect-gate arms (12/12, 10/10, 46/46, 9/9); each dead generation costs 122 s —
+Cloudflare's interactive timeout — and they consumed **40.6% of all lane-time**.
+Twelve failures cost more than two hundred successes.
+
+Measured, one variable, 2 lanes, both arms: switching the trigger to the
+escalation callback took rate **6.66 -> 9.33 tok/min (+40%)**,
+`cf_errors.timeout` **12 -> 0**, dead generations **12 -> 0**, clicks/token
+**2.79 -> 1.49**, build->token p50 **-19%**, with **acceptance unchanged at
+100%**.
+
+So: **the TRIGGER must be `before-interactive-callback`.** Keep the rect as a
+secondary sanity check if you like (`--click-gate both`) — a widget whose rect
+is genuinely `0x0` still cannot be clicked — but never as the trigger.
 
 THE PRIMARY METRIC IS THE SOLVE PATH, NOT THE TOKEN COUNT
 ---------------------------------------------------------
@@ -88,9 +113,43 @@ import urllib.request
 from pathlib import Path
 
 from camoufox.async_api import AsyncCamoufox
+from camoufox import DefaultAddons
 
 TARGET_URL = "https://gartic.io"
 SITEKEY = "0x4AAAAAABBPKaIbNwnPEfSo"
+
+# Prefs that remove work this workload never needs. Measured on the Oracle VM
+# 2026-07-24 together with --no-ubo: -14% CPU per token, -29% peak RSS,
+# acceptance unchanged (8/8 JOINED). Camoufox's anti-detection is compiled into
+# the browser rather than delivered by prefs, which is why the fingerprint
+# survives — but acceptance is re-verified per arm anyway, because a rate gain
+# that costs acceptance is worthless.
+#
+# ⚠️ On an IDLE GitHub runner these convert to ZERO extra tokens: nothing there
+# is waiting on CPU. They are for the Oracle VM, which runs at ~1% idle, and
+# that is where the original win was measured.
+LEAN_PREFS = {
+    "media.rdd-process.enabled": False,
+    "media.gpu-process-decoder": False,
+    "media.autoplay.default": 5,
+    "media.peerconnection.enabled": False,
+    "media.webspeech.synth.enabled": False,
+    "toolkit.telemetry.enabled": False,
+    "toolkit.telemetry.unified": False,
+    "datareporting.healthreport.uploadEnabled": False,
+    "browser.safebrowsing.malware.enabled": False,
+    "browser.safebrowsing.phishing.enabled": False,
+    "browser.safebrowsing.downloads.enabled": False,
+    "extensions.blocklist.enabled": False,
+    "app.update.enabled": False,
+    "browser.search.update": False,
+    "network.dns.disablePrefetch": True,
+    "network.prefetch-next": False,
+    "browser.sessionstore.interval": 3600000,
+    "browser.cache.disk.enable": False,
+    "dom.ipc.processCount": 1,
+    "dom.ipc.processPrelaunch.enabled": False,
+}
 
 # Camoufox v152 yields zero tokens on this sitekey (error 600010); v135 works.
 # The workflow places that exact build by hand and passes --executable, because
@@ -1224,6 +1283,13 @@ async def open_page(args, ladder: "Ladder | None"):
         launch["geoip"] = True
     if args.geoip:
         launch["geoip"] = True
+    if args.no_ubo:
+        # uBlock Origin is Camoufox's ONLY default addon, and on the Oracle VM
+        # it alone cost ~11% of a core. Dropping it is the single cheapest CPU
+        # win available on a box that is CPU-bound.
+        launch["exclude_addons"] = [DefaultAddons.UBO]
+    if args.lean_prefs:
+        launch["firefox_user_prefs"] = dict(LEAN_PREFS)
 
     # LADDER. Rung overrides are applied last so they win over the defaults, and
     # the effective launch is printed: a rung that silently did nothing is worse
@@ -1664,6 +1730,24 @@ async def main() -> int:
                              "interleave and land on the wrong widget.")
     parser.add_argument("--click-min-w", type=int, default=20)
     parser.add_argument("--click-min-h", type=int, default=20)
+    # ── CPU arms. Default to the baseline value, so an arm that forgets a flag
+    # is a BASELINE arm and not a silently half-applied one.
+    #
+    # ⚠️ THESE TWO EXIST BECAUSE THE VM COPY OF THIS FILE ONCE HAD THEM AND THIS
+    # ONE DID NOT. A straight file swap then crash-looped VM lane 1 at `rc=2`
+    # (argparse rejecting an unknown flag) while `systemctl` still read `active`
+    # and the lane minted exactly zero — the silent-death shape. ONE generator
+    # carries BOTH flag sets; `check_click_profiles.py` fails the build if
+    # either disappears again.
+    parser.add_argument("--no-ubo", action="store_true",
+                        help="drop Camoufox's uBlock Origin addon (its only "
+                             "default addon). ~11%% of a core on the Oracle VM. "
+                             "On an idle runner it buys nothing; on a "
+                             "CPU-bound box it is the cheapest win there is.")
+    parser.add_argument("--lean-prefs", action="store_true",
+                        help="Firefox prefs that cut media/RDD/telemetry/"
+                             "safebrowsing/prefetch work and pin one content "
+                             "process (-14%% CPU/token, -29%% RSS on the VM)")
     parser.add_argument("--display", default=os.environ.get("DISPLAY", ""),
                         help="X display for xdotool (empty = page.mouse only)")
     # Browser
