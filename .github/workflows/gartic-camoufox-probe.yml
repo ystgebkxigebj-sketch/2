@@ -6,7 +6,7 @@ name: Gartic Camoufox PROBE (click-path + lane-concurrency instrumentation)
 # dispatch counts toward the fleet but is never touched by it. Get this wrong
 # and the supervisor sees zero live producers and dispatches a fresh fleet every
 # tick until it hits the hard cap.
-run-name: PROBE ${{ inputs.arm }} lanes=${{ inputs.lanes }} poll=${{ inputs.poll_ms }}ms gate=${{ inputs.click_gate }} serialize=${{ inputs.click_serialize }} ${{ inputs.duration }}s
+run-name: PROBE ${{ inputs.arm }} lanes=${{ inputs.lanes }} click=${{ inputs.click_profile }} gate=${{ inputs.click_gate }} ti=${{ inputs.token_interval }} ${{ inputs.duration }}s
 
 # ===========================================================================
 #  THE FLEET-FACING SELF-HEALING CAMOUFOX PRODUCER
@@ -43,6 +43,8 @@ run-name: PROBE ${{ inputs.arm }} lanes=${{ inputs.lanes }} poll=${{ inputs.poll
 #
 #   CAMOUFOX_FLEET_LANES           concurrent Turnstile widgets  (default 2)
 #   CAMOUFOX_FLEET_APPEARANCE      interaction-only | always     (default interaction-only)
+#   CAMOUFOX_FLEET_CLICK_GATE      rect | escalation | both      (default rect)
+#   CAMOUFOX_FLEET_CLICK_REARM_MS  non-rect gates: retry spacing (default 8000)
 #   CAMOUFOX_FLEET_TOKEN_INTERVAL  seconds a lane waits after a token (default 4)
 #   CAMOUFOX_FLEET_VERIFY_EVERY    seconds between self-verifications (default 90)
 #   CAMOUFOX_FLEET_COLLAPSE        consecutive code-5 that declare a collapse (default 5)
@@ -58,7 +60,36 @@ run-name: PROBE ${{ inputs.arm }} lanes=${{ inputs.lanes }} poll=${{ inputs.poll
 # supervisor default is how a tuned fleet quietly stops being the thing that
 # was tested.
 #
-# EVERY RUNNER GETS ITS OWN LABEL (`cfxheal-warp-f<run_number>`). A shared label
+# THE CLICK GATE (`CAMOUFOX_FLEET_CLICK_GATE`), added 2026-07-31.
+# --------------------------------------------------------------
+# The producer's click gate was `unionRect(slot) >= 20x20`, and `slot` is created
+# as a FIXED 300x70 div — so the gate is open ~5 ms after build(), while
+# Cloudflare escalates (`before-interactive-callback`) at 1481-2225 ms. The
+# clicker therefore fired ~1.5 s BEFORE a click was wanted, on every widget, and
+# again every `--click-interval` (3 s) after. Those premature clicks kill the
+# widget: across four probe arms `cf_errors.timeout` equalled the dead-generation
+# count EXACTLY (12/12, 10/10, 46/46, 9/9), a dead generation costs 122 s, and
+# dead generations consumed 40.6% of all lane-time.
+#
+# Gating on the escalation callback instead measured, one variable, 2 lanes both
+# arms: 9.33 vs 6.66 tok/min (+40%), cf_errors.timeout 0 vs 12, dead generations
+# 0 vs 12, clicks 420 vs 2647 (-84%), acceptance 100% in both (17/17 vs 18/18).
+#
+# THE DEFAULT HERE IS `rect` — the behaviour that is live today — precisely so
+# that uploading this file changes nothing on its own. Flipping the fleet is a
+# separate, single, reversible API call:
+#
+#   gh api -X PATCH repos/<owner>/2/actions/variables/CAMOUFOX_FLEET_CLICK_GATE \
+#     -f name=CAMOUFOX_FLEET_CLICK_GATE -f value=escalation     # roll forward
+#   ... -f value=rect                                           # roll BACK
+#
+# Neither takes effect on a running job — each takes effect on the next runner
+# the supervisor dispatches, which is what makes the rollout a same-fleet A/B
+# rather than a blind switch of all 12 runners at once.
+#
+# EVERY RUNNER GETS ITS OWN LABEL (`cfxheal-warp-f<run_number>`, plus a one-letter
+# gate suffix `e`/`b` when the gate is not `rect` — see the Produce step; the
+# `cfxheal-` prefix is untouched, so SERVE_TRUSTED_LABELS still matches). A shared label
 # is unusable at fleet scale: /stats/exits rows key on IP, WARP IPv4 is anycast
 # and reused (measured 2026-07-31: one row carried both `cfxheal-warp-fleet` and
 # `vm-l2`, and one runner posted from three addresses in six minutes), and the
@@ -125,6 +156,14 @@ on:
         description: Non-rect gates only. How long before a RETRY click is allowed on the same widget generation. Clicking a challenge that is still verifying is how a solve gets discarded and returned to us as cf_errors.timeout.
         required: false
         default: "8000"
+      click_profile:
+        description: "base | impl | batch | fast | min. HOW EXPENSIVE THE CLICK IS. `base` is the shipped ~620 ms humanised motion (16 waypoints x ~19 ms + 160 ms settle + 100 ms hold), ~92% of it deliberate sleep. `impl` and `batch` keep the pointer trace IDENTICAL and only remove process spawns / XSync round-trips - a free saving if it is one. `fast` and `min` DEGRADE THE MOTION and are a speed-vs-stealth trade: acceptance is the gate, not the rate."
+        required: false
+        default: base
+      verify_every:
+        description: Seconds between self-verification dials. Empty = the fleet variable CAMOUFOX_FLEET_VERIFY_EVERY. Set 60 to get >= 10 scored dials per 10-minute bin, which is what a per-bin acceptance read needs. Each dial costs one token, diverted rather than duplicated; tokens are ~74x oversupplied.
+        required: false
+        default: ""
       post_to_relay:
         description: Feed the live relay
         required: false
@@ -400,6 +439,21 @@ jobs:
           fi
           if [[ -n "${ALT_EXECUTABLE:-}" ]]; then alt=(--alt-executable "$ALT_EXECUTABLE"); fi
           secs=${{ inputs.duration }}
+          # ── CLICK GATE. Validated here rather than left to argparse so a
+          # typo'd repo variable says WHICH variable is wrong instead of dying
+          # 90 seconds of setup later inside the generator. The one-letter
+          # suffix on the label is what makes a runner's COHORT readable live
+          # from the relay's /stats/exits, where a fleet-wide beacon is the only
+          # thing that leaves a runner before its job ends five hours later.
+          gate='${{ (vars.CAMOUFOX_FLEET_CLICK_GATE || 'rect') }}'
+          case "$gate" in
+            rect)       gsfx='' ;;
+            escalation) gsfx='e' ;;
+            both)       gsfx='b' ;;
+            *) echo "CAMOUFOX_FLEET_CLICK_GATE='$gate' is not rect|escalation|both" >&2
+               exit 1 ;;
+          esac
+          echo "click_gate=$gate label_suffix='${gsfx:-<none>}'"
           if [[ '${{ inputs.click_serialize }}' == 'true' ]]; then ser=(--click-serialize); else ser=(); fi
           python -u 'turnstile-system/token generators/camoufox-fresh/generator_probe.py' \
             --out /tmp/tokens.jsonl \
@@ -410,6 +464,7 @@ jobs:
             --recycle-ms '${{ inputs.recycle_ms }}' \
             --click-gate '${{ inputs.click_gate }}' \
             --click-rearm-ms '${{ inputs.click_rearm_ms }}' \
+            --click-profile '${{ inputs.click_profile }}' \
             "${ser[@]}" \
             --appearance '${{ (vars.CAMOUFOX_FLEET_APPEARANCE || 'interaction-only') }}' \
             --token-interval '${{ inputs.token_interval }}' \
@@ -424,7 +479,7 @@ jobs:
             --executable "$HOME/.cache/camoufox/camoufox-bin" \
             --ff-version 135 \
             --verify-binary /tmp/roomverify \
-            --verify-every '${{ (vars.CAMOUFOX_FLEET_VERIFY_EVERY || '90') }}' \
+            --verify-every '${{ inputs.verify_every || vars.CAMOUFOX_FLEET_VERIFY_EVERY || '90' }}' \
             --verify-start-delay 120 \
             --verify-langs 19,2,1,0,5 \
             --collapse-threshold '${{ (vars.CAMOUFOX_FLEET_COLLAPSE || '5') }}' \
@@ -458,8 +513,11 @@ jobs:
               pass
           if not rows:
               print("NO TOKENS. Check the [diag] lines: if `escalations` > 0 and "
-                    "`clicks` == 0 the RECT GATE never opened — that is a CLICKER "
-                    "failure, not a Cloudflare verdict, and this run is UNTESTED.")
+                    "`clicks` == 0 the CLICK GATE never opened — that is a CLICKER "
+                    "failure, not a Cloudflare verdict, and this run is UNTESTED. "
+                    "On CAMOUFOX_FLEET_CLICK_GATE=escalation that means "
+                    "before-interactive-callback never fired; on `rect` it means "
+                    "the widget never laid out (a lane off-screen).")
           else:
               c = collections.Counter(r.get('solve', '?') for r in rows)
               auto, inter = c.get('auto', 0), c.get('int', 0)
