@@ -1,9 +1,20 @@
-"""Tests for fleet_master's slot accounting.
+"""Tests for fleet_master's slot accounting and minting liveness.
 
-The bug these pin cost a live fleet: a manually dispatched matrix run ("warp
-x18") kept reporting its title size after 10 of its 18 jobs had finished, so the
-supervisor saw a full fleet, dispatched nothing, and let production halve while
-logging success on every tick.
+Two incidents are pinned here.
+
+The first cost a live fleet: a manually dispatched matrix run ("warp x18") kept
+reporting its title size after 10 of its 18 jobs had finished, so the supervisor
+saw a full fleet, dispatched nothing, and let production halve while logging
+success on every tick.
+
+The second is the silent death this file's TestMintingLiveness exists for. On
+2026-08-01 run 30700078405 (`f51`) posted tokens for 21 minutes and then nothing
+for four hours. GitHub reported the job `in_progress` throughout, so the
+supervisor counted it toward both `alive` and `productive` — and because
+`alive` is what `hard_cap` is measured against, a hung runner SUPPRESSED the
+replacement that would have compensated for it.
+
+Run from this directory:  python -m pytest test_fleet_master.py -q
 """
 
 import sys
@@ -11,7 +22,10 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent))
 
-from fleet_master import Run, classify, plan_cycle  # noqa: E402
+from fleet_master import (  # noqa: E402
+    ExitEvidence, Run, assess_minting, classify, plan_cycle, producer_of,
+    read_exits,
+)
 
 
 def make_run(**kw) -> Run:
@@ -166,3 +180,334 @@ class TestClassify:
                 "display_title": "warp x18 18000s relay=true via=manual"}]
         runs = classify(raw, "warp", 1e9)
         assert runs and runs[0].live is None, "reconcile must be explicit, not implied"
+
+    def test_run_number_is_carried(self):
+        """The run number is the only link between a run and its tokens: the
+        producer labels every token `cfxheal-warp-f<run_number>...`."""
+        raw = [{"id": 5, "run_number": 51, "status": "in_progress",
+                "created_at": "2026-07-25T00:00:00Z",
+                "display_title": "warp x1 18000s relay=true via=supervisor"}]
+        assert classify(raw, "warp", 1e9)[0].number == 51
+
+
+# ---------------------------------------------------------------------------
+#  MINTING LIVENESS
+# ---------------------------------------------------------------------------
+
+def row(src, label, last_seen, labels=None, minted=999999):
+    """One /stats/exits row. `minted` is deliberately given an absurd, constant
+    value in every fixture: if any future change starts attributing a per-src
+    counter to a per-label producer, these tests must not be able to pass."""
+    out = {"src": src, "label": label, "lastSeenSecAgo": last_seen, "minted": minted}
+    if labels:
+        out["labels"] = labels
+    return out
+
+
+def gh_run(number, run_id=None, produce_started=0.0, via="supervisor"):
+    return Run(id=run_id if run_id is not None else 100000 + number,
+               status="in_progress",
+               title="warp x1 18000s relay=true via=%s" % via,
+               age=7200.0, tunnel="warp", producers=1, duration=18000, via=via,
+               number=number, produce_started=produce_started)
+
+
+class TestProducerIdentity:
+    def test_run_number_is_the_identity(self):
+        assert producer_of("cfxheal-warp-f51ed-r0w0-100of40") == ("gh", 51)
+
+    def test_the_self_report_suffix_is_not_identity(self):
+        """One runner emits many label STRINGS as its beacon moves. Reading them
+        as separate occupants would make every row look shared and inflate every
+        bound by occupancyGrace."""
+        assert (producer_of("cfxheal-warp-f59ed-r0w0-100of40")
+                == producer_of("cfxheal-warp-f59ed-r0w0-97of40"))
+
+    def test_vm_lanes_are_not_github_runners(self):
+        assert producer_of("vm-cfx4-r0w0-100of5") == ("other", "vm-cfx4")
+
+    def test_pre_label_contract_producers_are_unattributable(self):
+        """Runs 1-3 in the recorded history carried the old shared label
+        `cfxheal-warp-fleet`, which names no run. They must never be mistaken
+        for a run number."""
+        kind, ident = producer_of("cfxheal-warp-fleet-r0w0-0of0")
+        assert kind == "other"
+
+
+class TestReadExits:
+    def test_exclusive_row_gives_the_raw_age(self):
+        ev = read_exits({"exits": [row("1.1.1.1", "cfxheal-warp-f52ed-r0w0-100of40", 7)]})
+        assert ev.silence == {52: 7.0}
+
+    def test_one_runner_with_two_label_strings_is_still_exclusive(self):
+        ev = read_exits({"exits": [row(
+            "1.1.1.1", "cfxheal-warp-f59ed-r0w0-97of40", 5,
+            labels=["cfxheal-warp-f59ed-r0w0-100of40",
+                    "cfxheal-warp-f59ed-r0w0-97of40"])]})
+        assert ev.silence == {59: 5.0}, "same runner, so no attribution penalty"
+
+    def test_shared_row_pays_the_occupancy_grace(self):
+        """WARP's anycast v4 puts three runners on one address. The row's single
+        `minted` counter cannot be split, so the only sound statement is that
+        each named label minted within occupancyGrace of the row's last mint."""
+        ev = read_exits({"exits": [row(
+            "1.1.1.1", "cfxheal-warp-f56ed-r0w0-100of40", 0,
+            labels=["cfxheal-warp-f50ed-r0w0-100of40",
+                    "cfxheal-warp-f56ed-r0w0-100of40",
+                    "cfxheal-warp-f59ed-r0w0-100of40"])]})
+        assert ev.silence == {50: 600.0, 56: 600.0, 59: 600.0}
+
+    def test_a_runner_takes_the_best_row_it_appears_on(self):
+        """Minting anywhere proves it is alive, so the bound is a MIN across
+        rows — WARP rotates addresses under a live producer."""
+        ev = read_exits({"exits": [
+            row("1.1.1.1", "cfxheal-warp-f49ed-r0w0-100of40", 2198),
+            row("2.2.2.2", "cfxheal-warp-f49ed-r0w0-100of40", 3),
+        ]})
+        assert ev.silence == {49: 3.0}
+
+    def test_vm_lane_is_picked_up_as_the_off_fleet_control(self):
+        ev = read_exits({"exits": [row("3.3.3.3", "vm-cfx3-r0w0-100of40", 4)]})
+        assert ev.control_silence == 4.0
+        assert ev.silence == {}
+
+    def test_row_shared_between_a_vm_lane_and_a_runner(self):
+        """Observed live: one src carrying vm-cfx2, vm-cfx4 and a GitHub runner."""
+        ev = read_exits({"exits": [row(
+            "4.4.4.4", "vm-cfx4-r0w0-100of5", 1,
+            labels=["vm-cfx2-r1w0-100of40", "vm-cfx4-r0w0-100of5",
+                    "cfxheal-warp-f56ed-r0w0-100of40"])]})
+        assert ev.silence == {56: 601.0}
+        assert ev.control_silence == 601.0
+
+    def test_missing_last_seen_is_ignored_not_guessed(self):
+        assert read_exits({"exits": [{"src": "9.9.9.9",
+                                      "label": "cfxheal-warp-f9-r0w0-0of0"}]}).silence == {}
+
+
+class TestMintingLiveness:
+    THRESHOLD = 2700.0
+    STARTUP = 900.0
+
+    def assess(self, runs, evidence, ledger=None, now=100000.0, **kw):
+        return assess_minting(runs, evidence, ledger or {}, now,
+                              threshold=kw.pop("threshold", self.THRESHOLD),
+                              startup=kw.pop("startup", self.STARTUP), **kw)
+
+    def healthy(self, numbers, last_seen=3.0):
+        return ExitEvidence(silence={n: last_seen for n in numbers},
+                            control_silence=2.0, rows=len(numbers))
+
+    # ---- the f51 shape -------------------------------------------------
+    def test_f51_shape_is_detected(self):
+        """Seen minting, then absent from every row (WARP handed its address on
+        and the relay reset the row). Absence carries no clock, so the ledger
+        supplies one."""
+        runs = [gh_run(n) for n in (50, 51, 52, 53, 54, 55)]
+        ev = self.healthy([50, 52, 53, 54, 55])          # 51 is simply gone
+        ledger = {"runs": {str(gh_run(51).id): {"seen": 100000.0 - 3000, "ever": True}}}
+        check = self.assess(runs, ev, ledger)
+        assert check.verdict[gh_run(51).id] == "stalled"
+        assert check.stalled == {gh_run(51).id}
+        assert check.cancellable == [gh_run(51).id]
+
+    def test_a_stalled_runner_that_comes_back_is_forgiven_immediately(self):
+        """Any sighting re-anchors the clock to relay evidence, so a stale
+        ledger entry can never keep accusing a producer that recovered."""
+        runs = [gh_run(51)]
+        stale = {"runs": {str(gh_run(51).id): {"seen": 0.0, "ever": True}}}
+        check = self.assess(runs, self.healthy([51]), stale)
+        assert check.verdict[gh_run(51).id] == "producing"
+        assert check.stalled == set()
+
+    def test_visible_but_stale_needs_no_ledger_at_all(self):
+        runs = [gh_run(51)]
+        ev = ExitEvidence(silence={51: 4000.0}, control_silence=1.0, rows=1)
+        assert self.assess(runs, ev).verdict[gh_run(51).id] == "stalled"
+
+    # ---- what must NOT fire --------------------------------------------
+    def test_healthy_fleet_fires_on_nobody(self):
+        runs = [gh_run(n) for n in range(50, 62)]
+        check = self.assess(runs, self.healthy(range(50, 62)))
+        assert check.stalled == set()
+        assert set(check.verdict.values()) == {"producing"}
+
+    def test_the_longest_recovered_gap_ever_recorded_does_not_fire(self):
+        """f21, 2026-08-01 04:11Z: silent for a measured 1800 s bound and then
+        minting again at 04:40Z. It is the only healthy runner in 23 h of
+        recorded samples to exceed 970 s, and the threshold must clear it."""
+        runs = [gh_run(21)]
+        ev = ExitEvidence(silence={21: 1800.0}, control_silence=1.0, rows=1)
+        assert self.assess(runs, ev).verdict[gh_run(21).id] == "producing"
+
+    def test_a_shorter_threshold_would_have_killed_it(self):
+        """Pins WHY the threshold is 2700 and not 1800: a watchdog shorter than
+        the work it supervises causes the failure it watches for."""
+        runs = [gh_run(21)]
+        ev = ExitEvidence(silence={21: 1800.0}, control_silence=1.0, rows=1)
+        assert self.assess(runs, ev, threshold=1800.0).stalled == {gh_run(21).id}
+
+    def test_a_run_that_has_not_reached_produce_is_never_judged(self):
+        runs = [gh_run(60, produce_started=None)]
+        check = self.assess(runs, self.healthy([50]))
+        assert check.verdict[gh_run(60).id] == "starting"
+        assert check.stalled == set()
+
+    def test_startup_grace_is_measured_from_the_produce_step(self):
+        """Anchoring on created_at would accuse a runner that sat 37 min in
+        GitHub's queue — a wait this account has actually produced."""
+        runs = [gh_run(60, produce_started=100000.0 - 300)]
+        assert self.assess(runs, self.healthy([50])).verdict[gh_run(60).id] == "starting"
+
+    def test_no_snapshot_means_no_opinion(self):
+        runs = [gh_run(n) for n in (50, 51)]
+        check = self.assess(runs, None)
+        assert check.stalled == set() and "not evaluated" in check.note
+
+    def test_unattributable_fleet_abstains(self):
+        """If the label contract changes, every runner looks dead. Acting then
+        would cancel a perfectly healthy fleet."""
+        runs = [gh_run(n) for n in range(50, 56)]
+        check = self.assess(runs, ExitEvidence(silence={}, control_silence=1.0))
+        assert check.stalled == set() and "attributable" in check.note
+
+    def test_correlated_outage_acts_on_nobody(self):
+        """GitHub's cuts are network-wide and self-healing; gartic has global
+        acceptance outages of its own. Tearing a fleet down in response to one
+        is a documented mistake."""
+        runs = [gh_run(n) for n in range(50, 56)]
+        # Everyone is still visible, so attribution is healthy — four of the six
+        # have simply been quiet for longer than the threshold at once.
+        ev = ExitEvidence(silence={50: 3.0, 51: 3.0, 52: 4000.0, 53: 4000.0,
+                                   54: 4000.0, 55: 4000.0},
+                          control_silence=2.0, rows=6)
+        check = self.assess(runs, ev)
+        assert check.stalled == set() and "correlated" in check.note
+
+    def test_a_fleet_that_vanishes_together_also_abstains(self):
+        """The same event seen the other way round: during a fleet-wide outage
+        the quiet runners drop out of `/stats/exits` entirely, so the
+        attribution guard catches what the correlation guard would have."""
+        runs = [gh_run(n) for n in range(50, 56)]
+        ev = ExitEvidence(silence={50: 3.0, 51: 3.0}, control_silence=2.0, rows=2)
+        ledger = {"runs": {str(gh_run(n).id): {"seen": 90000.0, "ever": True}
+                           for n in range(52, 56)}}
+        check = self.assess(runs, ev, ledger)
+        assert check.stalled == set() and "acting on nobody" in check.note
+
+    def test_a_quiet_off_fleet_control_vetoes_the_check(self):
+        """The VM is a different machine on a different network. If it stopped
+        minting in the same window, the event is host-wide."""
+        runs = [gh_run(n) for n in (50, 51, 52, 53)]
+        ev = ExitEvidence(silence={50: 3.0, 51: 3.0, 52: 3.0}, control_silence=5000.0)
+        ledger = {"runs": {str(gh_run(53).id): {"seen": 90000.0, "ever": True}}}
+        check = self.assess(runs, ev, ledger)
+        assert check.stalled == set() and "host-wide" in check.note
+
+    def test_a_long_dead_control_does_not_veto_forever(self):
+        """If the VM's producers are simply switched off, its rows go stale for
+        good — and letting that disable the GitHub check permanently would be a
+        silent way of undoing this whole feature."""
+        runs = [gh_run(n) for n in (50, 51, 52, 53)]
+        ev = ExitEvidence(silence={50: 3.0, 51: 3.0, 52: 3.0},
+                          control_silence=99999.0)
+        ledger = {"runs": {str(gh_run(53).id): {"seen": 90000.0, "ever": True}}}
+        assert self.assess(runs, ev, ledger).stalled == {gh_run(53).id}
+
+    # ---- never-produced is downgraded but never killed -----------------
+    def test_never_seen_runner_is_downgraded_but_not_cancellable(self):
+        """Three runs in the recorded history were never attributable and all
+        three were healthy — they predated the per-run label. A hang and a
+        label-contract mismatch look identical from here, so the cheap remedy
+        applies and the irreversible one does not."""
+        runs = [gh_run(n) for n in (50, 51, 52, 53)]
+        ev = self.healthy([50, 51, 52])
+        check = self.assess(runs, ev)
+        assert check.verdict[gh_run(53).id] == "never-produced"
+        assert check.stalled == {gh_run(53).id}
+        assert check.cancellable == []
+
+    def test_a_foreign_run_is_never_cancellable(self):
+        runs = [gh_run(n) for n in (50, 51, 52)] + [gh_run(53, via="manual")]
+        ledger = {"runs": {str(gh_run(53).id): {"seen": 90000.0, "ever": True}}}
+        check = self.assess(runs, self.healthy([50, 51, 52]), ledger)
+        assert check.stalled == {gh_run(53).id} and check.cancellable == []
+
+    # ---- ledger mechanics ----------------------------------------------
+    def test_ledger_records_the_relay_anchored_time_not_now(self):
+        runs = [gh_run(51)]
+        ev = ExitEvidence(silence={51: 601.0}, control_silence=1.0, rows=1)
+        entry = self.assess(runs, ev).ledger["runs"][str(gh_run(51).id)]
+        assert entry["seen"] == 100000.0 - 601.0 and entry["ever"] is True
+
+    def test_finished_runs_drop_out_of_the_ledger(self):
+        """Only runs passed in are carried forward, so the file cannot grow
+        without bound as the fleet churns through run ids."""
+        runs = [gh_run(51)]
+        old = {"runs": {"999": {"seen": 1.0, "ever": True},
+                        str(gh_run(51).id): {"seen": 2.0, "ever": True}}}
+        assert set(self.assess(runs, self.healthy([51]), old).ledger["runs"]) == \
+            {str(gh_run(51).id)}
+
+    def test_a_lost_cache_cannot_accuse_anyone(self):
+        """Cache miss: every absent runner starts its clock at its Produce step,
+        so nothing can be judged until a full threshold has passed."""
+        runs = [gh_run(51, produce_started=100000.0 - 1000)]
+        check = self.assess(runs, ExitEvidence(silence={50: 1.0}, control_silence=1.0))
+        assert check.verdict[gh_run(51).id] == "producing"
+
+
+class TestStalledSlotAccounting:
+    """A stalled run still HOLDS its runner slot — that is the whole reason it
+    blocks its own replacement — so it must keep counting toward `alive` while
+    dropping out of `productive`."""
+
+    def fleet(self, n=12):
+        return [gh_run(50 + i) for i in range(n)]
+
+    def test_stalled_run_stops_counting_as_productive(self):
+        runs = self.fleet(12)
+        base = plan_cycle(runs, target=12, hard_cap=18, overlap_seconds=1800,
+                          max_dispatch=6, max_cancel=0)
+        assert base.dispatch == 0
+        with_stall = plan_cycle(runs, target=12, hard_cap=18, overlap_seconds=1800,
+                                max_dispatch=6, max_cancel=0,
+                                stalled={runs[1].id})
+        assert with_stall.dispatch == 1
+        assert sum(r.slots for r in with_stall.stalled) == 1
+
+    def test_stalled_run_still_counts_toward_the_hard_cap(self):
+        """It really is occupying a runner. Pretending otherwise would let the
+        fleet overshoot the account's concurrent-job ceiling."""
+        runs = self.fleet(18)
+        plan = plan_cycle(runs, target=18, hard_cap=18, overlap_seconds=1800,
+                          max_dispatch=6, max_cancel=0, stalled={runs[0].id})
+        assert plan.dispatch == 0, "no room; the cap is measured on alive"
+        assert plan.blocked_by_cap is True
+
+    def test_blocked_by_cap_is_false_when_the_ramp_is_the_limit(self):
+        """The heavier remedy is reserved for a cap block. A per-cycle ramp
+        limit is not a reason to cancel anything — the next cycle covers it."""
+        runs = self.fleet(4)
+        plan = plan_cycle(runs, target=16, hard_cap=18, overlap_seconds=1800,
+                          max_dispatch=2, max_cancel=0)
+        assert plan.dispatch == 2 and plan.blocked_by_cap is False
+
+    def test_the_measured_incident(self):
+        """16:38Z on 2026-08-01: six runners retired together, the supervisor
+        wanted six replacements, and `hard_cap 18 - 16 alive` permitted two —
+        with f51 among the sixteen counted as alive AND productive."""
+        runs = self.fleet(16)
+        retiring = {r.id for r in runs[:6]}
+        aged = [Run(**{**r.__dict__, "age": r.duration - 100})
+                if r.id in retiring else r for r in runs]
+        before = plan_cycle(aged, target=16, hard_cap=18, overlap_seconds=1800,
+                            max_dispatch=6, max_cancel=0)
+        after = plan_cycle(aged, target=16, hard_cap=18, overlap_seconds=1800,
+                           max_dispatch=6, max_cancel=0, stalled={runs[10].id})
+        assert before.dispatch == 2 and before.blocked_by_cap is True
+        # Downgrading the hung runner does not by itself free a slot — the cap
+        # is what binds — which is exactly why cancelling exists as an opt-in
+        # and why hard_cap deserves the headroom recommendation.
+        assert after.dispatch == 2 and after.blocked_by_cap is True
+        assert sum(r.slots for r in after.stalled) == 1
