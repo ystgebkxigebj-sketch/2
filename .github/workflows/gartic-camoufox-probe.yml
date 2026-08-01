@@ -157,7 +157,7 @@ on:
         required: false
         default: "8000"
       click_profile:
-        description: "base | impl | batch | fast | min. HOW EXPENSIVE THE CLICK IS. `base` is the shipped ~620 ms humanised motion (16 waypoints x ~19 ms + 160 ms settle + 100 ms hold), ~92% of it deliberate sleep. `impl` and `batch` keep the pointer trace IDENTICAL and only remove process spawns / XSync round-trips - a free saving if it is one. `fast` and `min` DEGRADE THE MOTION and are a speed-vs-stealth trade: acceptance is the gate, not the rate."
+        description: "base | dedupe | impl | batch | fast | min. HOW EXPENSIVE THE CLICK IS. `base` is the shipped ~620 ms humanised motion (16 waypoints x ~19 ms + 160 ms settle + 100 ms hold), ~92% of it deliberate sleep. `impl` and `batch` keep the pointer trace IDENTICAL and only remove process spawns / XSync round-trips - a free saving if it is one. `fast` and `min` DEGRADE THE MOTION and are a speed-vs-stealth trade: acceptance is the gate, not the rate."
         required: false
         default: base
       verify_every:
