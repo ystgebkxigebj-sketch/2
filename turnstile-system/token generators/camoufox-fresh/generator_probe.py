@@ -488,10 +488,11 @@ CLICK_PROFILES: dict[str, dict] = {
     "impl": dict(waypoints=(12, 20), step_ms=(8, 30), settle_ms=(90, 230),
                  hold_ms=(60, 140), approach_px=(80, 220), sync=False, batch=True,
                  dedupe=False),
-    # Isolates the batching half of `impl`, for attribution.
-    "batch": dict(waypoints=(12, 20), step_ms=(8, 30), settle_ms=(90, 230),
-                  hold_ms=(60, 140), approach_px=(80, 220), sync=True, batch=True,
-                  dedupe=False),
+    # (A `batch` profile — --sync kept, 3 spawns folded into 1 — was measured and
+    # REMOVED. Batching is worth ~35 ms, it is not the mechanism, and because it
+    # keeps --sync it still emits ~0.3 zero-length moves per click: it looks like
+    # a fix and is not one. check_click_profiles.py now fails any profile that
+    # keeps --sync without deduping, so it cannot come back by accident.)
     # DEGRADED MOTION, mild: a third of the waypoints, a third of the dwell.
     "fast": dict(waypoints=(5, 8), step_ms=(4, 12), settle_ms=(45, 90),
                  hold_ms=(40, 80), approach_px=(60, 160), sync=False, batch=True,
