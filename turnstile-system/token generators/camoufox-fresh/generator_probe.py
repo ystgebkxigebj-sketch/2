@@ -120,10 +120,10 @@ RENDERER_JS = r"""
   var CLICK_MIN_W = __CLICK_MIN_W__;
   var CLICK_MIN_H = __CLICK_MIN_H__;
   var POLL_MS = __POLL_MS__;
-  var CLICK_GATE = '__CLICK_GATE__';   // rect | escalation | both
-  var REARM_MS = __CLICK_REARM_MS__;   // retry spacing, non-rect gates only
   var RECYCLE_MS = __RECYCLE_MS__;
   function now() { return (window.performance && performance.now) ? performance.now() : Date.now(); }
+  var CLICK_GATE = '__CLICK_GATE__';   // rect | escalation | both
+  var REARM_MS = __CLICK_REARM_MS__;   // retry spacing, non-rect gates only
 
   function log(s) { try { console.log(s); } catch (e) {} }
 
@@ -183,15 +183,20 @@ RENDERER_JS = r"""
     var gen = 0, id = null, slot = null, sawInter = false, emitted = false;
     var lastW = -1, lastH = -1, ticks = 0;
     // PHASE TIMELINE. All marks are ms since this generation's build().
-    var tBuild = 0, tInter = -1, tRect = -1, tClick = -1, nClickAt = 0;
-    var wantClick = false, lastArm = 0;
+    // `nClickAt` is NOT declared here: the base generator now owns it as
+    // part of the click gate, and a second `var` would shadow nothing but
+    // would quietly invite one of the two resets to be forgotten.
+    var tBuild = 0, tInter = -1, tRect = -1, tClick = -1;
+    // CLICK GATE state. `wantClick` is set by before-interactive-callback and
+    // is the only thing that opens a non-rect gate; `lastArm` spaces retries.
+    var wantClick = false, lastArm = 0, nClickAt = 0;
 
     function build() {
       gen++;
       var myGen = gen;
       sawInter = false; emitted = false; lastW = -1; lastH = -1; ticks = 0;
-      tBuild = now(); tInter = -1; tRect = -1; tClick = -1; nClickAt = 0;
-      wantClick = false; lastArm = 0;
+      tBuild = now(); tInter = -1; tRect = -1; tClick = -1;
+      wantClick = false; lastArm = 0; nClickAt = 0;
       if (slot && slot.parentNode) slot.parentNode.removeChild(slot);
       slot = document.createElement('div');
       slot.id = 'lane_' + i + '_' + myGen;
@@ -227,6 +232,8 @@ RENDERER_JS = r"""
           'expired-callback': function () { defer(myGen, 0); },
           'timeout-callback': function () { log('E:timeout'); defer(myGen, 0); },
           'before-interactive-callback': function () {
+            // THIS is the "a click is wanted, now" signal. Cloudflare calls it
+            // exactly when it escalates a widget to interactive.
             sawInter = true; wantClick = true;
             if (tInter < 0) tInter = now() - tBuild;
             log('INTER lane=' + i + ' gen=' + myGen);
@@ -272,24 +279,40 @@ RENDERER_JS = r"""
               ' inter=' + (sawInter ? 1 : 0));
           lastW = w; lastH = h;
         }
-        // THE RECT GATE. Never `if (iframe)` — an escalated interaction-only
-        // widget exposes no iframe, which is exactly the bug this file fixes.
+        // ── THE CLICK GATE ──────────────────────────────────────────────
+        // Never `if (iframe)` — an escalated interaction-only widget exposes
+        // no iframe, which is exactly the bug this file was written to fix.
+        // Which signal opens the gate is `--click-gate`:
+        //
+        //   rect       the historical behaviour, and a NO-OP. `slot` is a FIXED
+        //              300x70 div, so unionRect(slot) is >= 300x70 from the
+        //              instant it is appended — before render() has drawn
+        //              anything and before Cloudflare has decided whether to
+        //              escalate. Measured on the probe: the gate opens 5 ms
+        //              after build() while before-interactive-callback fires at
+        //              1481-2225 ms, so every widget is clicked ~1.5 s BEFORE a
+        //              click is wanted, and again every --click-interval after.
+        //   escalation before-interactive-callback fired, and only then. One
+        //              click per escalation, REARM_MS the only retry.
+        //   both       escalated AND laid out.
+        //
+        // Why it matters: across four rect-gate probe arms `cf_errors.timeout`
+        // equalled the DEAD-GENERATION count exactly (12/12, 10/10, 46/46,
+        // 9/9), a dead generation costs 122 s (Cloudflare's interactive
+        // timeout), and dead generations ate 40.6% of all lane-time. Gating on
+        // escalation instead measured 9.33 vs 6.66 tok/min (+40%) with
+        // cf_errors.timeout = 0 and acceptance unchanged at 100%.
         var rectOK = (w >= CLICK_MIN_W && h >= CLICK_MIN_H);
         if (rectOK && tRect < 0) tRect = now() - tBuild;
-        // rect       = production behaviour. ALWAYS true (see the module
-        //              docstring); the clicker fires blind every tick.
-        // escalation = Cloudflare called before-interactive-callback, and
-        //              only then. One click per escalation.
-        // both       = escalated AND laid out. The safe production choice.
         var fire = (CLICK_GATE === 'rect') ? rectOK
                  : (CLICK_GATE === 'escalation') ? wantClick
                  : (wantClick && rectOK);
         if (fire && CLICK_GATE !== 'rect') {
-          var tn = now();
-          // Re-arm, never spray: a click that has not yet been answered is
-          // not evidence that another click is wanted, and clicking a
-          // challenge that is mid-verification is how a solve gets thrown
-          // away and reported back to us as cf_errors.timeout.
+          // Re-arm, never spray: a click that has not been answered yet is not
+          // evidence that another click is wanted, and clicking a challenge
+          // that is mid-verification is how a solve gets thrown away and is
+          // reported back to us as cf_errors.timeout.
+          var tn = Date.now();
           if (nClickAt > 0 && (tn - lastArm) < REARM_MS) fire = false;
           else lastArm = tn;
         }
@@ -411,6 +434,49 @@ def parse_proxy(raw: str) -> dict:
 # ---------------------------------------------------------------------------
 # X11 click driver
 # ---------------------------------------------------------------------------
+# CLICK COST PROFILES.
+#
+# The click is ~620 ms of wall time and ~92% of that is DELIBERATE SLEEP, not
+# I/O: 16 waypoints x ~19 ms of inter-step pause + ~160 ms settle + ~100 ms hold.
+# Note what it is NOT — the waypoints are already chained into ONE `xdotool`
+# invocation (one process, one X connection), so "spawn a helper that holds a
+# persistent X connection" cannot recover the 620 ms; at most it recovers the
+# two EXTRA spawns that `mousedown`/`mouseup` cost.
+#
+# The two levers that are genuinely free (identical pointer positions, identical
+# programmed timing, so an identical trace reaches Cloudflare) are:
+#   * `batch`  — fold mousedown/hold/mouseup into the same invocation via
+#                `xdotool click --delay <hold> 1`: 3 spawns -> 1.
+#   * `sync`   — drop `--sync`, the per-waypoint XSync round-trip. The X server
+#                still processes the motions in order at the same wall-clock
+#                times; only our confirmation wait goes away.
+# Everything below those two DEGRADES THE MOTION and is therefore a stealth
+# trade-off, not a free saving. Measure acceptance, never rate alone.
+#
+# `base` is exactly the behaviour that shipped, so an unflagged run is unchanged.
+CLICK_PROFILES: dict[str, dict] = {
+    # the control: 12-20 waypoints, --sync on every one, 3 process spawns
+    "base": dict(waypoints=(12, 20), step_ms=(8, 30), settle_ms=(90, 230),
+                 hold_ms=(60, 140), approach_px=(80, 220), sync=True, batch=False),
+    # IMPLEMENTATION-ONLY. Same waypoint count, same jitter, same sleeps, same
+    # approach geometry — one spawn and no XSync. If this is materially faster
+    # it is a pure win with nothing traded away.
+    "impl": dict(waypoints=(12, 20), step_ms=(8, 30), settle_ms=(90, 230),
+                 hold_ms=(60, 140), approach_px=(80, 220), sync=False, batch=True),
+    # Isolates the two halves of `impl`, for attribution if `impl` wins.
+    "batch": dict(waypoints=(12, 20), step_ms=(8, 30), settle_ms=(90, 230),
+                  hold_ms=(60, 140), approach_px=(80, 220), sync=True, batch=True),
+    # DEGRADED MOTION, mild: a third of the waypoints, a third of the dwell.
+    "fast": dict(waypoints=(5, 8), step_ms=(4, 12), settle_ms=(45, 90),
+                 hold_ms=(40, 80), approach_px=(60, 160), sync=False, batch=True),
+    # DEGRADED MOTION, extreme: no approach at all — the pointer teleports to
+    # the target, settles briefly and clicks. This is the cheapest click that is
+    # still a click, and the one most likely to cost acceptance.
+    "min": dict(waypoints=(0, 0), step_ms=(0, 0), settle_ms=(20, 40),
+                hold_ms=(30, 50), approach_px=(0, 0), sync=False, batch=True),
+}
+
+
 class XdoDriver:
     """Click through XTEST, addressing the browser window found on $DISPLAY.
 
@@ -420,12 +486,19 @@ class XdoDriver:
     log line still looks healthy.
     """
 
-    def __init__(self, display: str) -> None:
+    def __init__(self, display: str, profile: str = "base") -> None:
         self.display = display
         self.available = bool(shutil.which("xdotool")) and bool(display)
         self.win: tuple[int, int, int, int] | None = None   # x, y, w, h
         self.win_at = 0.0
         self.fail = 0
+        self.profile_name = profile
+        self.profile = CLICK_PROFILES[profile]
+        # Per-click cost breakdown, refreshed by click(). `prog_ms` is the time
+        # we ASKED for (the humanisation sleeps); the gap between it and the
+        # measured wall time is everything X and the process table cost us, and
+        # it is the only part a better implementation can ever recover.
+        self.last: dict = {}
 
     def _run(self, *cmd: str, timeout: float = 10.0) -> str:
         env = dict(os.environ, DISPLAY=self.display)
@@ -495,33 +568,63 @@ class XdoDriver:
         return sx, sy
 
     def click(self, sx: int, sy: int) -> bool:
-        """Approach from a random angle, ease in, overshoot, correct, hold."""
+        """Approach from a random angle, ease in, overshoot, correct, hold.
+
+        Shape and cost come from the active CLICK_PROFILES entry; `base`
+        reproduces the historical sequence exactly.
+        """
         if not self.available:
             return False
+        prof = self.profile
         try:
             steps: list[str] = []
-            ang = random.uniform(0, 6.283)
-            dist = random.uniform(80, 220)
-            ox = sx + dist * math.cos(ang)
-            oy = sy + dist * math.sin(ang)
-            ox = min(max(ox, 5), 4000)
-            oy = min(max(oy, 5), 4000)
-            n = random.randint(12, 20)
-            tx = sx + random.uniform(-4, 4)
-            ty = sy + random.uniform(-3, 3)
-            for i in range(1, n + 1):
-                t = i / n
-                e = 4 * t * t * t if t < 0.5 else 1 - ((-2 * t + 2) ** 3) / 2
-                steps += ["mousemove", "--sync",
-                          str(int(ox + (tx - ox) * e + random.uniform(-1.2, 1.2))),
-                          str(int(oy + (ty - oy) * e + random.uniform(-1.2, 1.2))),
-                          "sleep", f"{random.uniform(0.008, 0.03):.3f}"]
-            steps += ["mousemove", "--sync", str(sx), str(sy),
-                      "sleep", f"{random.uniform(0.09, 0.23):.3f}"]
-            self._run("xdotool", *steps, timeout=25)
-            self._run("xdotool", "mousedown", "1", timeout=5)
-            time.sleep(random.uniform(0.06, 0.14))
-            self._run("xdotool", "mouseup", "1", timeout=5)
+            move = ["mousemove", "--sync"] if prof["sync"] else ["mousemove"]
+            prog = 0.0                       # seconds of sleep we asked for
+            lo_n, hi_n = prof["waypoints"]
+            n = random.randint(lo_n, hi_n) if hi_n > 0 else 0
+            if n > 0:
+                ang = random.uniform(0, 6.283)
+                dist = random.uniform(*prof["approach_px"])
+                ox = sx + dist * math.cos(ang)
+                oy = sy + dist * math.sin(ang)
+                ox = min(max(ox, 5), 4000)
+                oy = min(max(oy, 5), 4000)
+                tx = sx + random.uniform(-4, 4)
+                ty = sy + random.uniform(-3, 3)
+                step_lo, step_hi = prof["step_ms"]
+                for i in range(1, n + 1):
+                    t = i / n
+                    e = 4 * t * t * t if t < 0.5 else 1 - ((-2 * t + 2) ** 3) / 2
+                    pause = random.uniform(step_lo, step_hi) / 1000.0
+                    prog += pause
+                    steps += move + [
+                        str(int(ox + (tx - ox) * e + random.uniform(-1.2, 1.2))),
+                        str(int(oy + (ty - oy) * e + random.uniform(-1.2, 1.2))),
+                        "sleep", f"{pause:.3f}"]
+            settle = random.uniform(*prof["settle_ms"]) / 1000.0
+            prog += settle
+            steps += move + [str(sx), str(sy), "sleep", f"{settle:.3f}"]
+            hold = random.uniform(*prof["hold_ms"]) / 1000.0
+            prog += hold
+            started = time.monotonic()
+            if prof["batch"]:
+                # ONE process, one X connection, mousedown/hold/mouseup included.
+                steps += ["click", "--delay", str(max(1, int(round(hold * 1000)))), "1"]
+                self._run("xdotool", *steps, timeout=25)
+                spawns = 1
+            else:
+                self._run("xdotool", *steps, timeout=25)
+                self._run("xdotool", "mousedown", "1", timeout=5)
+                time.sleep(hold)
+                self._run("xdotool", "mouseup", "1", timeout=5)
+                spawns = 3
+            self.last = {
+                "prof": self.profile_name,
+                "prog_ms": round(prog * 1000, 1),
+                "wall_ms": round((time.monotonic() - started) * 1000, 1),
+                "wp": n,
+                "spawns": spawns,
+            }
             self.fail = 0
             return True
         except Exception as error:  # noqa: BLE001
@@ -543,6 +646,10 @@ class Stats:
         self.clicks_xdo = 0
         self.clicks_mouse = 0
         self.solved_after_click = 0
+        # Clicks spent on generations that DID mint. Everything else was spent
+        # on a generation that died — which is the cost the escalation gate
+        # exists to remove, and it is invisible in any token-keyed metric.
+        self.clicks_on_token = 0
         self.errors: dict[str, int] = {}
         self.rect_max: dict[int, tuple[int, int]] = {}
         self.escalations = 0
@@ -569,7 +676,6 @@ class Stats:
         self.clickat_seen = 0             # CLICKAT console lines received
         self.clickat_dropped_interval = 0 # ... suppressed by --click-interval
         self.clickat_dropped_max = 0      # ... suppressed by --click-max
-        self.clicks_on_token = 0          # clicks on generations that DID mint
 
     def rate_per_min(self) -> float:
         elapsed = time.monotonic() - self.started
@@ -1148,6 +1254,11 @@ async def run_session(args, stats: Stats, out_handle, deadline: float | None,
                             t_xdo = time.monotonic()
                             ok = xdo.click(*screen)
                             row["xdo_ms"] = round((time.monotonic() - t_xdo) * 1000, 1)
+                            # prog_ms = the sleeps the profile ASKED for.
+                            # xdo_ms - prog_ms is everything X and the
+                            # process table cost, i.e. the only part any
+                            # better implementation could ever recover.
+                            row.update(xdo.last)
                     finally:
                         with inflight_lock:
                             stats.click_inflight -= 1
@@ -1466,6 +1577,31 @@ async def main() -> int:
                              "Playwright's page.mouse")
     parser.add_argument("--click-max", type=int, default=8,
                         help="clicks per widget generation before giving up")
+    parser.add_argument("--click-gate",
+                        choices=("rect", "escalation", "both"), default="rect",
+                        help="WHAT OPENS THE CLICK GATE. rect (default) is the "
+                             "historical behaviour and a NO-OP — the slot is a "
+                             "fixed 300x70 div, so the gate is open from "
+                             "creation and the clicker fires ~1.5 s before "
+                             "Cloudflare escalates, every --click-interval. "
+                             "escalation clicks when "
+                             "before-interactive-callback fires, the real "
+                             "signal (measured +40% rate, cf_errors.timeout "
+                             "12 -> 0). both = escalated AND laid out. The "
+                             "default stays `rect` so uploading this file "
+                             "changes nothing on its own.")
+    parser.add_argument("--click-rearm-ms", type=int, default=8000,
+                        help="non-rect gates: how long to wait before a RETRY "
+                             "click on the same widget generation")
+    parser.add_argument("--click-profile",
+                        choices=tuple(CLICK_PROFILES), default="base",
+                        help="HOW EXPENSIVE THE CLICK IS. `base` (default) is "
+                             "the shipped 16-waypoint humanised motion, ~620 ms, "
+                             "~92%% of it deliberate sleep. `impl`/`batch` keep "
+                             "the pointer trace byte-identical and only remove "
+                             "process spawns and XSync round-trips. `fast` and "
+                             "`min` DEGRADE THE MOTION and are a stealth "
+                             "trade-off: score acceptance, never rate alone.")
     parser.add_argument("--poll-ms", type=int, default=1000,
                         help="widget poll tick. The production value is 1000, "
                              "which costs ~0.5 s of latency detecting the "
@@ -1474,17 +1610,6 @@ async def main() -> int:
     parser.add_argument("--recycle-ms", type=int, default=400,
                         help="pause between turnstile.remove() and the next "
                              "render() for a lane")
-    parser.add_argument("--click-gate",
-                        choices=("rect", "escalation", "both"), default="rect",
-                        help="rect = production, and a NO-OP: the slot is a "
-                             "fixed 300x70 div so the gate is open from "
-                             "creation and the clicker fires blind every "
-                             "tick. escalation = click when "
-                             "before-interactive-callback fires, the real "
-                             "signal. both = escalated AND laid out.")
-    parser.add_argument("--click-rearm-ms", type=int, default=8000,
-                        help="non-rect gates: how long to wait before a "
-                             "RETRY click on the same generation")
     parser.add_argument("--click-serialize", action="store_true",
                         help="hold a global lock across the whole xdotool "
                              "mousemove/down/up sequence. There is ONE X "
@@ -1581,7 +1706,7 @@ async def main() -> int:
     args.out.parent.mkdir(parents=True, exist_ok=True)
     stats = Stats()
     deadline = time.monotonic() + args.duration if args.duration else None
-    xdo = XdoDriver(args.display)
+    xdo = XdoDriver(args.display, profile=args.click_profile)
 
     ladder = Ladder(args)
     verifier = None
@@ -1611,6 +1736,7 @@ async def main() -> int:
         f"appearance={args.appearance} humanize={args.humanize} "
         f"headless={args.headless} display={args.display or 'none'} "
         f"xdotool={'yes' if xdo.available else 'NO — page.mouse only'} "
+        f"click_profile={args.click_profile} "
         f"lifetime={args.browser_lifetime}s stall={args.stall_timeout}s "
         f"reload={args.reload_interval}s ff={args.ff_version} "
         f"proxy={'yes' if os.environ.get('PROXY', '').strip() else 'direct'} "
@@ -1667,6 +1793,19 @@ async def main() -> int:
             "clicks_xdotool": stats.clicks_xdo,
             "clicks_mouse": stats.clicks_mouse,
             "solved_after_click": stats.solved_after_click,
+            # ── CLICK WASTE. The rect gate's whole cost shows up here: clicks
+            # landing on generations that never minted, each one able to throw
+            # away a solve and come back as cf_errors.timeout.
+            "click_gate": args.click_gate,
+            "click_profile": args.click_profile,
+            "clicks_on_minting_generations": stats.clicks_on_token,
+            "clicks_on_dead_generations": stats.clicks - stats.clicks_on_token,
+            "clicks_wasted_pct": round(100.0 * (stats.clicks - stats.clicks_on_token)
+                                       / stats.clicks, 1) if stats.clicks else -1.0,
+            "clicks_per_token": round(stats.clicks / stats.tokens, 2)
+                                if stats.tokens else -1.0,
+            "clicks_per_escalation": round(stats.clicks / stats.escalations, 2)
+                                     if stats.escalations else -1.0,
             "escalations": stats.escalations,
             "max_rect": {str(k): f"{w}x{h}" for k, (w, h) in stats.rect_max.items()},
             "elapsed_s": round(elapsed, 1),
@@ -1722,17 +1861,22 @@ async def main() -> int:
         "lock_ms": spread(stats.clicklat, "lock_ms"),
         "geo_ms": spread(stats.clicklat, "geo_ms"),
         "xdo_ms": spread(xdo_rows, "xdo_ms"),
+        # THE CLICK-COST DECOMPOSITION. prog_ms is the humanisation sleep
+        # the profile asked for; xdo_ms - prog_ms is process spawn + X
+        # round-trip, and is the ONLY part a better implementation can
+        # recover without changing the pointer trace Cloudflare scores.
+        "prog_ms": spread(xdo_rows, "prog_ms"),
+        "overhead_ms": spread([dict(r, ov=round(r["xdo_ms"] - r["prog_ms"], 1))
+                               for r in xdo_rows
+                               if "xdo_ms" in r and "prog_ms" in r], "ov"),
+        "waypoints": spread(xdo_rows, "wp"),
+        "click_profile": args.click_profile,
+        "spawns_per_click": (xdo_rows[-1].get("spawns") if xdo_rows else -1),
+        # Delivered clicks per second of WALL time -- the capacity number.
+        "clicks_per_sec": round(len(stats.clicklat) /
+                                max(1e-9, time.monotonic() - stats.started), 3),
         "total_ms": spread(stats.clicklat, "total_ms"),
         "serialize": bool(args.click_serialize),
-        "gate": args.click_gate,
-        "clicks_on_minting_generations": stats.clicks_on_token,
-        "clicks_on_dead_generations": stats.clicks - stats.clicks_on_token,
-        "wasted_pct": round(100.0 * (stats.clicks - stats.clicks_on_token)
-                            / stats.clicks, 1) if stats.clicks else -1.0,
-        "clicks_per_token": round(stats.clicks / stats.tokens, 2)
-                            if stats.tokens else -1.0,
-        "clicks_per_escalation": round(stats.clicks / stats.escalations, 2)
-                                 if stats.escalations else -1.0,
         "poll_ms": args.poll_ms,
         "recycle_ms": args.recycle_ms,
     }, sort_keys=True), flush=True)
