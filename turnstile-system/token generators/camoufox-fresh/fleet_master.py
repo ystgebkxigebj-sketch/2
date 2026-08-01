@@ -350,6 +350,12 @@ def assess_minting(runs: list[Run], evidence: ExitEvidence | None, ledger: dict,
     check.ledger = {"version": 1, "runs": fresh}
 
     if evidence is None:
+        # Do not leave "stalled" sitting in the per-run report when nothing was
+        # measured. A log line that reads like a verdict but was produced by an
+        # absent instrument is how this project has repeatedly talked itself
+        # into a false conclusion.
+        for run in judged:
+            check.verdict[run.id] = "unknown:no-snapshot"
         check.note = "no /stats/exits snapshot — minting liveness not evaluated"
         return check
     if not judged:
