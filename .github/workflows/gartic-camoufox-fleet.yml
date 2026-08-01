@@ -44,6 +44,7 @@ run-name: ${{ inputs.tunnel }} x${{ inputs.producers }} ${{ inputs.duration }}s 
 #   CAMOUFOX_FLEET_LANES           concurrent Turnstile widgets  (default 2)
 #   CAMOUFOX_FLEET_APPEARANCE      interaction-only | always     (default interaction-only)
 #   CAMOUFOX_FLEET_CLICK_GATE      rect | escalation | both      (default rect)
+#   CAMOUFOX_FLEET_CLICK_PROFILE   base|dedupe|impl|fast|min     (default base)
 #   CAMOUFOX_FLEET_CLICK_REARM_MS  non-rect gates: retry spacing (default 8000)
 #   CAMOUFOX_FLEET_TOKEN_INTERVAL  seconds a lane waits after a token (default 4)
 #   CAMOUFOX_FLEET_VERIFY_EVERY    seconds between self-verifications (default 90)
@@ -417,11 +418,33 @@ jobs:
             *) echo "CAMOUFOX_FLEET_CLICK_GATE='$gate' is not rect|escalation|both" >&2
                exit 1 ;;
           esac
-          echo "click_gate=$gate label_suffix='${gsfx:-<none>}'"
+          # ── CLICK PROFILE. `base` is the shipped humanised motion. Its
+          # `mousemove --sync` blocks until a MotionNotify arrives, and a move to
+          # the position the pointer is ALREADY at generates none — so it waits
+          # for the full 25 s subprocess timeout. A cubic ease crawls sub-pixel
+          # at both ends, so consecutive waypoints round to the same integer
+          # constantly: measured 12/40 = 30% of production-shape clicks stall,
+          # mean cost 2.76 s against 0.51 s healthy, click throughput 0.36/s vs
+          # 1.97/s. `impl` drops --sync and folds mousedown/hold/mouseup into the
+          # same invocation. IDENTICAL waypoints, coordinates and dwell — the
+          # pointer trace Cloudflare scores does not change — so this is an
+          # implementation fix, not a stealth trade.
+          prof='${{ (vars.CAMOUFOX_FLEET_CLICK_PROFILE || 'base') }}'
+          case "$prof" in
+            base)   psfx='' ;;
+            dedupe) psfx='d' ;;
+            impl)   psfx='i' ;;
+            fast)   psfx='f' ;;
+            min)    psfx='m' ;;
+            *) echo "CAMOUFOX_FLEET_CLICK_PROFILE='$prof' is not base|dedupe|impl|fast|min" >&2
+               exit 1 ;;
+          esac
+          echo "click_gate=$gate click_profile=$prof label_suffix='${gsfx}${psfx:-}'"
           python -u 'turnstile-system/token generators/camoufox-fresh/generator_selfheal.py' \
             --out /tmp/tokens.jsonl \
-            --label "cfxheal-${{ inputs.tunnel }}-f${{ github.run_number }}$gsfx" \
+            --label "cfxheal-${{ inputs.tunnel }}-f${{ github.run_number }}$gsfx$psfx" \
             --click-gate "$gate" \
+            --click-profile "$prof" \
             --click-rearm-ms '${{ (vars.CAMOUFOX_FLEET_CLICK_REARM_MS || '8000') }}' \
             --duration "$secs" \
             --lanes '${{ (vars.CAMOUFOX_FLEET_LANES || '2') }}' \
