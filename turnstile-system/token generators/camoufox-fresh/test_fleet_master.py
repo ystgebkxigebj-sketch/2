@@ -280,6 +280,16 @@ class TestReadExits:
         assert ev.silence == {56: 601.0}
         assert ev.control_silence == 601.0
 
+    def test_an_unlabelled_co_occupant_still_makes_the_row_shared(self):
+        """The relay renders a producer that posts no label at all as the literal
+        string "(unlabelled)" inside `labels`. It is still a second occupant, so
+        the row's evidence still has to pay the attribution slack."""
+        ev = read_exits({"exits": [row(
+            "5.5.5.5", "cfxheal-warp-f52ed-r0w0-100of40", 0,
+            labels=["(unlabelled)", "cfxheal-warp-f52ed-r0w0-100of40"])]})
+        assert ev.silence == {52: 600.0}
+        assert ev.control_silence is None, "an unlabelled row is not the VM control"
+
     def test_missing_last_seen_is_ignored_not_guessed(self):
         assert read_exits({"exits": [{"src": "9.9.9.9",
                                       "label": "cfxheal-warp-f9-r0w0-0of0"}]}).silence == {}
