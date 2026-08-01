@@ -30,6 +30,17 @@ What this one has to get right instead:
      empty, misspelled or otherwise unreadable value means *disabled*. A kill
      switch that only works when its input parses is not a kill switch.
 
+  4. **A runner that has stopped MINTING must stop counting.** GitHub reports a
+     wedged producer as a perfectly healthy `in_progress` job, and the fleet's
+     own acceptance beacon says nothing about a producer that mints nothing at
+     all. Measured 2026-08-01: run 30700078405 (`f51`) posted tokens for 21
+     minutes and then nothing for four hours while occupying a slot the
+     supervisor counted toward both `alive` and `productive` — so it also
+     *suppressed the refill that would have compensated for it*. The liveness
+     signal is the relay's own record of who minted (see assess_minting), never
+     GitHub's job status. This is the same silent-death class that
+     `lane-mint-watchdog` covers on the Oracle VM.
+
 The supervisor never dispatches a producer that self-dispatches a successor, and
 producers have no cron of their own. That is the whole reason a supervisor
 exists rather than an `if: always()` chain.
@@ -83,6 +94,21 @@ class Run:
     # reconcile_slots() fills it in; see slots below for why it matters.
     live: int | None = None
 
+    # GitHub's `run_number`. It is the ONLY link between a run and the tokens it
+    # produced: the producer labels every token `cfxheal-<tunnel>-f<run_number>…`
+    # (gartic-camoufox-fleet.yml), so the relay knows runners by this number and
+    # nothing else. None means the run cannot be scored for minting at all.
+    number: int | None = None
+
+    # Epoch second at which this run's `Produce` step started — the moment it
+    # became reasonable to expect tokens. NOT `created_at`: a run can sit queued
+    # for 37 minutes waiting for a runner grant, and then spends ~5 more minutes
+    # installing Camoufox and bringing up WARP before the first token. Anchoring
+    # the liveness clock on `created_at` would therefore accuse a runner of being
+    # dead while it was still being born. None = the step has not started, which
+    # is judged as "starting", never as stalled.
+    produce_started: float | None = None
+
     @property
     def slots(self) -> int:
         """Producer jobs this run STILL contributes.
@@ -105,9 +131,264 @@ class Run:
 class Plan:
     productive: list[Run] = field(default_factory=list)
     retiring: list[Run] = field(default_factory=list)
+    # Runs that hold a slot but are not minting. They still count toward `alive`
+    # — they really are occupying a runner — but never toward `productive`, so a
+    # replacement is dispatched for them.
+    stalled: list[Run] = field(default_factory=list)
     dispatch: int = 0
     cancel: list[Run] = field(default_factory=list)
     reason: str = ""
+    # True when the fleet is short of target and the SHORTFALL WAS CAPPED by
+    # hard_cap rather than by the per-cycle ramp. That is the only situation in
+    # which a stalled run is worth the heavier remedy of cancelling it: with
+    # room to spare, downgrading it from `productive` already gets it replaced.
+    blocked_by_cap: bool = False
+
+
+# ---------------------------------------------------------------------------
+#  MINTING LIVENESS
+# ---------------------------------------------------------------------------
+#
+# Every producer tags each token it POSTs to the relay with a label, and the
+# GitHub fleet's label carries its run number:
+#
+#     cfxheal-warp-f51ed-r0w0-100of40
+#                  ^^^ github.run_number
+#
+# so a runner's identity at the relay is its LABEL, never its IP. It has to be:
+# WARP's IPv4 pool is anycast and small, and two or three of our own producers
+# routinely mint from the same address at the same time.
+#
+# ⚠️ THE TRAP THIS CODE EXISTS TO AVOID. `/stats/exits` keeps exactly ONE
+# `minted` counter per address. On a shared row that counter is the SUM over its
+# occupants, and splitting it per label is not approximation, it is invention —
+# it manufactured a false result on 2026-07-30 and it is defect #6 in
+# HANDOFF-2026-08-01 §5. **Nothing here divides, apportions or fits `minted`.**
+# The only two facts read off a row are:
+#
+#   `lastSeenSecAgo` — how long ago ANY activity touched this address. Because
+#       assignments and verdicts bump it as well as mints, it is a LOWER bound on
+#       time-since-last-mint. Lower is the safe direction: a row that reads stale
+#       is definitely not minting, so the check can be late but never wrong.
+#
+#   `labels` / `label` — who minted here. The relay prunes a label from a row
+#       once it has been quiet for `occupancyGrace` (= tokenRefTTL = 600 s) at
+#       the next mint on that row, so membership is itself a freshness statement:
+#       a label still present minted within 600 s of that row's last mint.
+#
+# which give a sound UPPER BOUND on how long a given runner has been silent:
+#
+#   exclusive row (one producer)  ->  lastSeenSecAgo
+#   shared row (two or more)      ->  lastSeenSecAgo + 600
+#
+# and a runner's bound is the MINIMUM over every row that names it, because
+# minting anywhere proves it is alive. A runner named by no row at all yields no
+# bound — that is the honest UNKNOWN, and it is handled by the ledger below
+# rather than guessed at.
+
+# `cfxheal-<tunnel>-f<run_number><gate><profile>-r<rung>w<wraps>-<pct>of<n>`.
+# Only the run number is identity; everything after it is the producer's live
+# self-report and changes constantly (which is why one runner legitimately shows
+# several distinct label strings on one row).
+RUNNER_LABEL_RE = re.compile(r"^cfxheal-[a-z0-9]+-f(\d+)[a-z]*(?:-|$)")
+
+# Must equal the relay's `occupancyGrace` (tunnel system/relay/exits.go), which
+# is `tokenRefTTL` = 10 min. If the relay ever changes it, a shared row's bound
+# here becomes optimistic and this check could accuse a live runner.
+OCCUPANCY_GRACE_SECONDS = 600.0
+
+# Producers that are not GitHub runners. `vm-` is the Oracle VM's own lanes and
+# is the off-fleet control: it is a different machine on a different network, so
+# if it went quiet at the same moment the fleet did, the event is not N runner
+# hangs (see assess_minting).
+CONTROL_LABEL_PREFIX = "vm-"
+
+
+def producer_of(label: str) -> tuple[str, object]:
+    """Identity of whoever posted `label`, with its live self-report stripped.
+
+    Two label strings from one producer (`…-100of40` and `…-97of40`) must not
+    read as two occupants, or every row would look shared and every bound would
+    be inflated by 600 s.
+    """
+    match = RUNNER_LABEL_RE.match(label)
+    if match:
+        return ("gh", int(match.group(1)))
+    return ("other", label.split("-r")[0])
+
+
+@dataclass
+class ExitEvidence:
+    """What one `/stats/exits` snapshot proves about who is still minting."""
+
+    # run_number -> UPPER BOUND, in seconds, on time since that runner minted.
+    silence: dict[int, float] = field(default_factory=dict)
+    # Same bound for the off-fleet control (the VM's lanes). None = no control
+    # row in the snapshot, which means "no opinion", not "the VM is fine".
+    control_silence: float | None = None
+    rows: int = 0
+
+
+def read_exits(payload: dict) -> ExitEvidence:
+    evidence = ExitEvidence()
+    rows = (payload or {}).get("exits") or []
+    evidence.rows = len(rows)
+    for row in rows:
+        last_seen = row.get("lastSeenSecAgo")
+        if last_seen is None:
+            continue
+        labels = {row.get("label") or ""}
+        labels.update(row.get("labels") or [])
+        labels.discard("")
+        occupants = {producer_of(l) for l in labels}
+        if not occupants:
+            continue
+        # One producer on the row means its counter-free evidence is exact; two
+        # or more means the best we can say is "within occupancyGrace of the
+        # row's last mint".
+        bound = float(last_seen)
+        if len(occupants) > 1:
+            bound += OCCUPANCY_GRACE_SECONDS
+        for kind, ident in occupants:
+            if kind == "gh":
+                prior = evidence.silence.get(ident)
+                if prior is None or bound < prior:
+                    evidence.silence[ident] = bound
+            elif isinstance(ident, str) and ident.startswith(CONTROL_LABEL_PREFIX):
+                if evidence.control_silence is None or bound < evidence.control_silence:
+                    evidence.control_silence = bound
+    return evidence
+
+
+@dataclass
+class MintCheck:
+    verdict: dict[int, str] = field(default_factory=dict)     # run id -> word
+    silence: dict[int, float] = field(default_factory=dict)   # run id -> seconds
+    stalled: set[int] = field(default_factory=set)            # run ids
+    cancellable: list[int] = field(default_factory=list)      # run ids, worst first
+    ledger: dict = field(default_factory=dict)                # to persist
+    note: str = ""
+
+
+def assess_minting(runs: list[Run], evidence: ExitEvidence | None, ledger: dict,
+                   now: float, *, threshold: float, startup: float,
+                   min_attributable: float = 0.5,
+                   control_stale_after: float | None = None) -> MintCheck:
+    """Decide which runs have stopped minting.
+
+    Why a LEDGER is needed at all, and why `/stats/exits` alone cannot answer
+    this: a row is wiped outright when WARP hands its address to a different
+    producer (`resetOccupancyLocked`), so a runner that stops minting disappears
+    from the snapshot within minutes and takes its timestamp with it. `f51` was
+    gone 4 minutes after its last token. Absence is therefore the signal — but
+    absence carries no clock, so the supervisor keeps its own: one epoch per run,
+    re-anchored to relay evidence every time the runner is visible. A stale
+    ledger cannot accuse anyone, because any sighting overwrites it.
+
+    Everything here fails toward "no opinion":
+
+      * no snapshot (relay down, no credential)  -> nothing is stalled
+      * run has not reached its `Produce` step   -> "starting"
+      * too few runners attributable at all      -> abstain, act on nobody
+      * the off-fleet control is quiet too       -> abstain (host-wide episode)
+      * half the fleet quiet at once             -> abstain (correlated outage)
+
+    The last two are not politeness. GitHub's acceptance cuts are network-wide
+    and self-healing, gartic has global acceptance outages of its own, and
+    tearing a fleet down in response to one is a mistake this project has already
+    made and written down.
+    """
+    check = MintCheck()
+    if control_stale_after is None:
+        # Past this, a quiet control is not an episode — the VM is simply not
+        # running producers, and letting that veto the check forever would be a
+        # silent way of disabling it.
+        control_stale_after = 6 * threshold
+
+    prior = (ledger or {}).get("runs") or {}
+    fresh: dict[str, dict] = {}
+    judged: list[Run] = []
+    visible = 0
+
+    for run in runs:
+        key = str(run.id)
+        was = prior.get(key) or {}
+        ever = bool(was.get("ever"))
+        if run.number is None:
+            check.verdict[run.id] = "unknown:unattributable"
+            continue
+        if run.produce_started is None or now - run.produce_started < startup:
+            # Not yet expected to mint. Hold the clock at "now" so the grace
+            # period is not silently consumed while the runner is still starting.
+            check.verdict[run.id] = "starting"
+            fresh[key] = {"seen": now, "ever": ever}
+            continue
+
+        bound = None if evidence is None else evidence.silence.get(run.number)
+        if bound is not None:
+            visible += 1
+            last_ok = now - bound
+            ever = True
+        else:
+            last_ok = was.get("seen")
+            if last_ok is None:
+                # Never seen and no history: the clock starts when it should
+                # have started minting, so a producer that never mints once is
+                # still caught — that is the `no click driver` failure mode.
+                last_ok = run.produce_started
+        silence = max(0.0, now - float(last_ok))
+        fresh[key] = {"seen": float(last_ok), "ever": ever}
+        check.silence[run.id] = silence
+        judged.append(run)
+        if silence < threshold:
+            check.verdict[run.id] = "producing"
+        elif ever:
+            check.verdict[run.id] = "stalled"
+        else:
+            check.verdict[run.id] = "never-produced"
+
+    check.ledger = {"version": 1, "runs": fresh}
+
+    if evidence is None:
+        check.note = "no /stats/exits snapshot — minting liveness not evaluated"
+        return check
+    if not judged:
+        check.note = "no runner is old enough to score yet"
+        return check
+
+    quiet = [r for r in judged if check.verdict[r.id] != "producing"]
+    if visible < min_attributable * len(judged):
+        # Two very different things look the same from here — a fleet-wide
+        # outage (silent runners vanish from the snapshot within minutes) and a
+        # changed label contract — and the right response to both is the same.
+        check.note = (f"only {visible}/{len(judged)} runners are attributable at "
+                      f"the relay — a fleet-wide outage or a changed label "
+                      f"contract; acting on nobody")
+        return check
+    control = evidence.control_silence
+    if control is not None and threshold <= control < control_stale_after:
+        check.note = (f"off-fleet control (vm-) also quiet for {control/60:.0f}m "
+                      f"— host-wide episode, not {len(quiet)} hangs; acting on nobody")
+        return check
+    if len(quiet) >= 3 and len(quiet) >= 0.5 * len(judged):
+        check.note = (f"{len(quiet)}/{len(judged)} runners went quiet together — "
+                      f"correlated outage, not individual hangs; acting on nobody")
+        return check
+
+    check.stalled = {r.id for r in quiet}
+    # Only a runner that WAS minting and stopped may be cancelled. A runner that
+    # has never been seen is far more likely to be a label-contract mismatch than
+    # a hang — three such runs exist in the recorded history, all healthy, from
+    # before the per-run label was introduced — so it is downgraded but never
+    # killed.
+    check.cancellable = [r.id for r in quiet
+                         if check.verdict[r.id] == "stalled" and r.ours]
+    check.cancellable.sort(key=lambda i: -check.silence[i])
+    if quiet:
+        check.note = (f"{len(quiet)} not minting: " +
+                      ", ".join(f"{r.id}(f{r.number},{check.silence[r.id]/60:.0f}m,"
+                                f"{check.verdict[r.id]})" for r in quiet))
+    return check
 
 
 def age_seconds(created_at: str | None, now_epoch: float) -> float:
@@ -136,7 +417,8 @@ def classify(raw_runs: list[dict], tunnel: str, now_epoch: float) -> list[Run]:
             out.append(Run(int(raw["id"]), raw["status"],
                            raw.get("display_title") or "?",
                            age_seconds(raw.get("created_at"), now_epoch),
-                           "unknown", 1, 0, "unknown"))
+                           "unknown", 1, 0, "unknown",
+                           number=raw.get("run_number")))
             continue
         if match.group("tunnel") != tunnel:
             continue
@@ -149,13 +431,14 @@ def classify(raw_runs: list[dict], tunnel: str, now_epoch: float) -> list[Run]:
             producers=int(match.group("producers")),
             duration=int(match.group("duration")),
             via=match.group("via"),
+            number=raw.get("run_number"),
         ))
     return sorted(out, key=lambda r: r.age)
 
 
 def plan_cycle(runs: list[Run], *, target: int, hard_cap: int,
                overlap_seconds: float, max_dispatch: int,
-               max_cancel: int) -> Plan:
+               max_cancel: int, stalled: set[int] = frozenset()) -> Plan:
     """Decide this cycle's dispatches and cancellations.
 
     A run counts toward the target until it is within `overlap_seconds` of its
@@ -177,7 +460,15 @@ def plan_cycle(runs: list[Run], *, target: int, hard_cap: int,
     for run in runs:
         remaining = run.duration - run.age if run.duration else float("inf")
         window = min(overlap_seconds, run.duration / 3.0) if run.duration else overlap_seconds
-        (plan.retiring if remaining <= window else plan.productive).append(run)
+        if run.id in stalled:
+            # Holds a slot, produces nothing. Counted in `alive` below (it is
+            # really there) but never in `held`, so the fleet is refilled around
+            # it instead of pretending it is working.
+            plan.stalled.append(run)
+        elif remaining <= window:
+            plan.retiring.append(run)
+        else:
+            plan.productive.append(run)
 
     held = sum(r.slots for r in plan.productive)
     alive = sum(r.slots for r in runs)
@@ -186,6 +477,7 @@ def plan_cycle(runs: list[Run], *, target: int, hard_cap: int,
         want = target - held
         room = max(0, hard_cap - alive)
         plan.dispatch = min(want, max_dispatch, room)
+        plan.blocked_by_cap = room < want and room < max_dispatch
         if plan.dispatch < want:
             plan.reason = (f"want {want} more, dispatching {plan.dispatch} "
                            f"(per-cycle cap {max_dispatch}, hard cap {hard_cap} "
@@ -266,6 +558,38 @@ class GitHubAPI:
                    and job.get("status") in ACTIVE_STATUSES)
         return live or None
 
+    def produce_started_at(self, repo: str, run_id: int,
+                           now_epoch: float) -> float | None:
+        """Epoch at which this run's `Produce` step began, or None.
+
+        This is the liveness clock's anchor and it is deliberately a STEP time,
+        not the run's `created_at` and not the job's `started_at`. `created_at`
+        is when the run was queued — a run has sat queued for 37 minutes on this
+        account — and `job.started_at` is stamped at QUEUE time too, a trap this
+        project has already recorded. The step, by contrast, starts the instant
+        the generator is launched, after Camoufox and WARP are up. Measured on
+        run 30700078405: Produce started 12:42:39Z and its first token reached
+        the relay at 12:43:03Z, 24 s later.
+
+        None means "no opinion" — the caller treats that as `starting` and never
+        as stalled, so an API failure cannot manufacture a hang.
+        """
+        try:
+            data = self.request(
+                "GET", f"repos/{repo}/actions/runs/{run_id}/jobs?per_page=100")
+        except RuntimeError:
+            return None
+        best: float | None = None
+        for job in data.get("jobs") or []:
+            for step in job.get("steps") or []:
+                name = (step.get("name") or "").strip().lower()
+                if not name.startswith("produce") or not step.get("started_at"):
+                    continue
+                stamp = now_epoch - age_seconds(step.get("started_at"), now_epoch)
+                if best is None or stamp < best:
+                    best = stamp
+        return best
+
     def dispatch(self, repo: str, workflow: str, branch: str, inputs: dict) -> None:
         workflow_id = urllib.parse.quote(workflow, safe="")
         self.request("POST", f"repos/{repo}/actions/workflows/{workflow_id}/dispatches",
@@ -288,6 +612,44 @@ class GitHubAPI:
                 return "gone"
             return f"failed: {message[:120]}"
         return "cancel-requested"
+
+
+def fetch_exits(url: str, auth: str) -> dict:
+    request = urllib.request.Request(url, headers={
+        "X-Auth": auth, "User-Agent": "camoufox-fleet-master/1"})
+    with urllib.request.urlopen(request, timeout=25) as response:
+        return json.loads(response.read())
+
+
+def load_state(path: str) -> dict:
+    """The liveness ledger, or an empty one.
+
+    A missing, truncated or unreadable file is not an error and must never be:
+    every run then re-anchors its clock to `now`, so the worst case of losing the
+    cache is that nothing can be judged for one full threshold. Failing loudly
+    here would take the whole supervisor down over a cache miss.
+    """
+    if not path:
+        return {}
+    try:
+        with open(path, encoding="utf-8") as handle:
+            data = json.load(handle)
+        return data if isinstance(data, dict) else {}
+    except (OSError, ValueError):
+        return {}
+
+
+def save_state(path: str, state: dict) -> None:
+    if not path:
+        return
+    try:
+        directory = os.path.dirname(path)
+        if directory:
+            os.makedirs(directory, exist_ok=True)
+        with open(path, "w", encoding="utf-8") as handle:
+            json.dump(state, handle)
+    except OSError as error:
+        print(f"  could not persist liveness ledger to {path}: {error}", flush=True)
 
 
 def truthy(raw: str) -> bool:
@@ -347,6 +709,38 @@ def main() -> int:
     parser.add_argument("--max-dispatch-per-cycle", type=int, default=4)
     parser.add_argument("--max-cancel-per-cycle", type=int, default=0,
                         help="0 disables shrinking; runs then simply age out")
+
+    # ---- minting liveness (see assess_minting). Off unless a relay URL AND a
+    # credential are both supplied, so the supervisor's existing behaviour is
+    # exactly preserved wherever it is not configured.
+    parser.add_argument("--relay-exits-url", default="",
+                        help="GET .../stats/exits; empty disables the check")
+    parser.add_argument("--relay-auth-env", default="RELAY_AUTH",
+                        help="env var holding the relay's X-Auth secret")
+    parser.add_argument("--state-file", default="",
+                        help="JSON ledger of when each run was last seen "
+                             "minting, carried between cycles by the Actions "
+                             "cache. Absent = every run starts its clock now, "
+                             "so nothing can be judged for one full threshold")
+    parser.add_argument("--stall-seconds", type=float, default=2700,
+                        help="silence that counts as stalled. Floor is the "
+                             "PRODUCER's own recovery: --browser-lifetime 1800 "
+                             "plus a restart's first-token latency (~150 s), "
+                             "and a watchdog shorter than the work it watches "
+                             "destroys the recovery it exists to wait for. The "
+                             "extra 600 s is the anycast attribution slack "
+                             "(occupancyGrace), because on a shared exit row "
+                             "the measurement is an upper bound that carries it")
+    parser.add_argument("--stall-startup-seconds", type=float, default=900,
+                        help="grace after the Produce step starts before a run "
+                             "can be judged (measured Produce->first token: 24 s)")
+    parser.add_argument("--max-stall-cancel-per-cycle", type=int, default=0,
+                        help="cancel at most this many stalled runs per cycle, "
+                             "and only when hard_cap is what is blocking the "
+                             "refill. 0 = never cancel, only stop counting them "
+                             "as productive. Cancelling DESTROYS the run's "
+                             "end-of-run summary (solve= / cf_errors), which is "
+                             "the only post-hoc diagnostic a producer leaves")
     parser.add_argument("--dry-run", action="store_true")
     args = parser.parse_args()
 
@@ -389,8 +783,9 @@ def main() -> int:
         return 1
     api = GitHubAPI(token)
 
+    now = time.time()
     raw = api.list_runs(args.repo, args.workflow)
-    runs = classify(raw, args.tunnel, time.time())
+    runs = classify(raw, args.tunnel, now)
     # Replace each run's title-derived size with its live job count. Only worth
     # an API call for runs that claim more than one producer: a producers=1 run
     # (everything the supervisor itself dispatches) cannot disagree with itself.
@@ -398,6 +793,24 @@ def main() -> int:
     runs = [replace(run, live=api.live_producer_jobs(args.repo, run.id))
             if run.producers > 1 else run
             for run in runs]
+
+    evidence = None
+    relay_auth = os.environ.get(args.relay_auth_env, "").strip()
+    if args.relay_exits_url and relay_auth:
+        try:
+            evidence = read_exits(fetch_exits(args.relay_exits_url, relay_auth))
+            runs = [replace(run, produce_started=api.produce_started_at(
+                args.repo, run.id, now)) for run in runs]
+        except Exception as error:            # noqa: BLE001 — never fatal
+            print(f"  minting liveness: /stats/exits unavailable ({error}); "
+                  f"check skipped this cycle", flush=True)
+            evidence = None
+    ledger = load_state(args.state_file)
+    check = assess_minting(
+        runs, evidence, ledger, now,
+        threshold=args.stall_seconds, startup=args.stall_startup_seconds)
+    save_state(args.state_file, check.ledger)
+
     plan = plan_cycle(
         runs,
         target=target,
@@ -405,6 +818,7 @@ def main() -> int:
         overlap_seconds=args.overlap_seconds,
         max_dispatch=args.max_dispatch_per_cycle,
         max_cancel=args.max_cancel_per_cycle,
+        stalled=check.stalled,
     )
 
     queued = sum(r.slots for r in runs if r.status != "in_progress")
@@ -416,16 +830,28 @@ def main() -> int:
         f"alive={sum(r.slots for r in runs)} (running={running} queued={queued}) "
         f"productive={sum(r.slots for r in plan.productive)} "
         f"retiring={sum(r.slots for r in plan.retiring)} "
+        f"stalled={sum(r.slots for r in plan.stalled)} "
         f"foreign={sum(r.slots for r in foreign)} "
         f"dispatch={plan.dispatch} cancel={len(plan.cancel)}",
         flush=True,
     )
     if plan.reason:
         print(f"  note: {plan.reason}", flush=True)
+    if check.note:
+        print(f"  minting: {check.note}", flush=True)
     for run in runs:
-        mark = "retiring" if run in plan.retiring else "productive"
+        if run in plan.stalled:
+            mark = "STALLED"
+        elif run in plan.retiring:
+            mark = "retiring"
+        else:
+            mark = "productive"
+        mint = check.verdict.get(run.id, "-")
+        quiet = check.silence.get(run.id)
+        quiet_s = f" quiet={quiet/60:.0f}m" if quiet is not None else ""
         print(f"  run {run.id} {run.status:<11} age={run.age/60:6.1f}m "
-              f"x{run.producers} via={run.via} {mark}", flush=True)
+              f"x{run.producers} via={run.via} {mark} mint={mint}{quiet_s}",
+              flush=True)
     if queued and running:
         print("  (queued producers are waiting on the account's job-concurrency "
               "ceiling; they count toward the target because they will start)",
@@ -456,6 +882,31 @@ def main() -> int:
             continue
         print(f"cancel run={run.id}: {api.cancel(args.repo, run.id)}", flush=True)
         time.sleep(1)
+
+    # ---- the heavier remedy, deliberately last and deliberately narrow ----
+    # A stalled run is normally left alone: it stops counting as productive, a
+    # replacement is dispatched, and it clears itself at GitHub's 5-hour wall,
+    # leaving its end-of-run summary intact. Cancelling is only worth its cost
+    # when hard_cap is the thing standing between the fleet and its target — the
+    # case where a hung runner suppresses its own replacement.
+    if args.max_stall_cancel_per_cycle > 0 and check.cancellable and plan.blocked_by_cap:
+        by_id = {r.id: r for r in runs}
+        for run_id in check.cancellable[:args.max_stall_cancel_per_cycle]:
+            run = by_id.get(run_id)
+            if run is None or not run.ours:
+                continue
+            quiet = check.silence.get(run_id, 0) / 60
+            if args.dry_run:
+                print(f"dry-run cancel STALLED run={run_id} quiet={quiet:.0f}m",
+                      flush=True)
+                continue
+            print(f"cancel STALLED run={run_id} (f{run.number}, quiet {quiet:.0f}m, "
+                  f"blocking the refill): {api.cancel(args.repo, run_id)}", flush=True)
+            time.sleep(1)
+    elif check.cancellable and args.max_stall_cancel_per_cycle > 0:
+        print(f"  {len(check.cancellable)} stalled run(s) left alone — the refill "
+              f"is not blocked by hard_cap, so downgrading them is enough",
+              flush=True)
 
     return 0
 
