@@ -443,37 +443,65 @@ def parse_proxy(raw: str) -> dict:
 # persistent X connection" cannot recover the 620 ms; at most it recovers the
 # two EXTRA spawns that `mousedown`/`mouseup` cost.
 #
-# The two levers that are genuinely free (identical pointer positions, identical
-# programmed timing, so an identical trace reaches Cloudflare) are:
+# THE ACTUAL DEFECT, measured 2026-08-01 and much larger than the sleep budget.
+# `xdotool mousemove --sync X Y` waits for a MotionNotify. A move to the position
+# the pointer is ALREADY at generates none, so it blocks — until some OTHER
+# thread moves the pointer, or the 25 s subprocess timeout. A cubic ease crawls
+# sub-pixel at both ends, so consecutive waypoints round to the same integer
+# constantly. Measured on the live VM lanes over 14,383 real clicks: p50 743 ms
+# but 27-28% >= 1 s and 13-16% >= 5 s, p90 6.0-8.4 s, MEAN 2.0-2.2 s — i.e.
+# 0.46-0.51 clicks/s, not the 1.6/s the p50 implies. It self-limits around 8.5 s
+# rather than the timeout because a SIBLING LANE's motion releases the block,
+# which is why a single lane is the worst case and why p50-based readings missed
+# it entirely: the whole pathology lives in the tail.
+#
+# The three levers that are genuinely free (identical pointer positions,
+# identical programmed timing, so an identical trace reaches Cloudflare):
+#   * `dedupe` — skip a mousemove whose INTEGER position equals the previous
+#                one, keeping its dwell. The page cannot observe a zero-length
+#                move, so nothing is lost; only the impossible wait goes.
+#   * `sync`   — drop `--sync` outright. The X server still processes the
+#                motions in order at the same wall-clock times; only our
+#                confirmation wait goes away.
 #   * `batch`  — fold mousedown/hold/mouseup into the same invocation via
-#                `xdotool click --delay <hold> 1`: 3 spawns -> 1.
-#   * `sync`   — drop `--sync`, the per-waypoint XSync round-trip. The X server
-#                still processes the motions in order at the same wall-clock
-#                times; only our confirmation wait goes away.
-# Everything below those two DEGRADES THE MOTION and is therefore a stealth
-# trade-off, not a free saving. Measure acceptance, never rate alone.
+#                `xdotool click --delay <hold> 1`: 3 spawns -> 1. Worth ~35 ms,
+#                and it shrinks the window in which another lane can move the
+#                pointer between our final move and our mousedown.
+# Everything below those DEGRADES THE MOTION and is a stealth trade-off, not a
+# free saving. Measure acceptance, never rate alone.
 #
 # `base` is exactly the behaviour that shipped, so an unflagged run is unchanged.
 CLICK_PROFILES: dict[str, dict] = {
     # the control: 12-20 waypoints, --sync on every one, 3 process spawns
     "base": dict(waypoints=(12, 20), step_ms=(8, 30), settle_ms=(90, 230),
-                 hold_ms=(60, 140), approach_px=(80, 220), sync=True, batch=False),
-    # IMPLEMENTATION-ONLY. Same waypoint count, same jitter, same sleeps, same
-    # approach geometry — one spawn and no XSync. If this is materially faster
-    # it is a pure win with nothing traded away.
+                 hold_ms=(60, 140), approach_px=(80, 220), sync=True, batch=False,
+                 dedupe=False),
+    # THE CONSERVATIVE FIX. Byte-for-byte `base` — same --sync, same three
+    # spawns, same everything — except that a mousemove to the pixel the pointer
+    # already occupies is dropped and its dwell kept. Smallest possible diff from
+    # production, and it retains the synchronisation semantics.
+    "dedupe": dict(waypoints=(12, 20), step_ms=(8, 30), settle_ms=(90, 230),
+                   hold_ms=(60, 140), approach_px=(80, 220), sync=True, batch=False,
+                   dedupe=True),
+    # IMPLEMENTATION-ONLY, the other way: no XSync at all, one spawn. Same
+    # waypoint count, same jitter, same sleeps, same approach geometry.
     "impl": dict(waypoints=(12, 20), step_ms=(8, 30), settle_ms=(90, 230),
-                 hold_ms=(60, 140), approach_px=(80, 220), sync=False, batch=True),
-    # Isolates the two halves of `impl`, for attribution if `impl` wins.
+                 hold_ms=(60, 140), approach_px=(80, 220), sync=False, batch=True,
+                 dedupe=False),
+    # Isolates the batching half of `impl`, for attribution.
     "batch": dict(waypoints=(12, 20), step_ms=(8, 30), settle_ms=(90, 230),
-                  hold_ms=(60, 140), approach_px=(80, 220), sync=True, batch=True),
+                  hold_ms=(60, 140), approach_px=(80, 220), sync=True, batch=True,
+                  dedupe=False),
     # DEGRADED MOTION, mild: a third of the waypoints, a third of the dwell.
     "fast": dict(waypoints=(5, 8), step_ms=(4, 12), settle_ms=(45, 90),
-                 hold_ms=(40, 80), approach_px=(60, 160), sync=False, batch=True),
+                 hold_ms=(40, 80), approach_px=(60, 160), sync=False, batch=True,
+                 dedupe=False),
     # DEGRADED MOTION, extreme: no approach at all — the pointer teleports to
     # the target, settles briefly and clicks. This is the cheapest click that is
     # still a click, and the one most likely to cost acceptance.
     "min": dict(waypoints=(0, 0), step_ms=(0, 0), settle_ms=(20, 40),
-                hold_ms=(30, 50), approach_px=(0, 0), sync=False, batch=True),
+                hold_ms=(30, 50), approach_px=(0, 0), sync=False, batch=True,
+                dedupe=False),
 }
 
 
@@ -580,6 +608,9 @@ class XdoDriver:
             steps: list[str] = []
             move = ["mousemove", "--sync"] if prof["sync"] else ["mousemove"]
             prog = 0.0                       # seconds of sleep we asked for
+            dedupe = prof.get("dedupe", False)
+            last_pt: tuple[int, int] | None = None
+            skipped = 0
             lo_n, hi_n = prof["waypoints"]
             n = random.randint(lo_n, hi_n) if hi_n > 0 else 0
             if n > 0:
@@ -597,13 +628,24 @@ class XdoDriver:
                     e = 4 * t * t * t if t < 0.5 else 1 - ((-2 * t + 2) ** 3) / 2
                     pause = random.uniform(step_lo, step_hi) / 1000.0
                     prog += pause
-                    steps += move + [
-                        str(int(ox + (tx - ox) * e + random.uniform(-1.2, 1.2))),
-                        str(int(oy + (ty - oy) * e + random.uniform(-1.2, 1.2))),
-                        "sleep", f"{pause:.3f}"]
+                    px = int(ox + (tx - ox) * e + random.uniform(-1.2, 1.2))
+                    py = int(oy + (ty - oy) * e + random.uniform(-1.2, 1.2))
+                    if dedupe and last_pt == (px, py):
+                        # A move to the pixel the pointer already occupies is
+                        # invisible to the page and impossible for --sync to
+                        # observe. Keep the DWELL, drop the dead request.
+                        steps += ["sleep", f"{pause:.3f}"]
+                        skipped += 1
+                        continue
+                    last_pt = (px, py)
+                    steps += move + [str(px), str(py), "sleep", f"{pause:.3f}"]
             settle = random.uniform(*prof["settle_ms"]) / 1000.0
             prog += settle
-            steps += move + [str(sx), str(sy), "sleep", f"{settle:.3f}"]
+            if dedupe and last_pt == (sx, sy):
+                steps += ["sleep", f"{settle:.3f}"]
+                skipped += 1
+            else:
+                steps += move + [str(sx), str(sy), "sleep", f"{settle:.3f}"]
             hold = random.uniform(*prof["hold_ms"]) / 1000.0
             prog += hold
             started = time.monotonic()
@@ -624,6 +666,10 @@ class XdoDriver:
                 "wall_ms": round((time.monotonic() - started) * 1000, 1),
                 "wp": n,
                 "spawns": spawns,
+                # Zero-length moves dropped. On `base` this is the count that
+                # WOULD have stalled; anything above 0 is a click production is
+                # currently paying up to 25 s for.
+                "nodup": skipped,
             }
             self.fail = 0
             return True
