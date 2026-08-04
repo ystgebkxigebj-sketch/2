@@ -87,6 +87,39 @@ on:
         default: "false"
         type: choice
         options: ["false", "true"]
+  # ── EVENT-DRIVEN REFILL. The cron below is NOT reliable enough on its own.
+  #
+  # `schedule:` asks for every 20 min. Measured on free public repos across four
+  # independent accounts (2026-08-02..04): it fired every 65-139 min on mature
+  # accounts, every 216-386 min on new ones, and once stopped ENTIRELY for
+  # 2h35m — on two unrelated accounts within one minute of each other, while
+  # `state` read `active` and every prior run read `success`. GitHub
+  # deprioritises scheduled workflows there, and the simultaneity across
+  # unrelated accounts says platform-side, not per-repo.
+  #
+  # A supervisor that does not run cannot replace an expiring producer, so the
+  # fleet decays — and if the runners were dispatched together it collapses to
+  # ZERO in one step (observed 2026-08-04: 12 runners, two cohorts, both ran a
+  # clean 5h01m to `success`, both ended together, account left at 0 producers).
+  #
+  # THE MOMENT A REPLACEMENT IS NEEDED IS THE MOMENT A PRODUCER ENDS — so wake
+  # on that event rather than polling on a timer that may never tick.
+  #
+  # ⚠️ This is NOT the runaway-respawn incident. That was a PRODUCER dispatching
+  # its own successor from `if: always()` — an uncapped self-replicating loop
+  # that burned ~15 runs. Here the SUPERVISOR wakes, and it still honours
+  # CAMOUFOX_FLEET_ENABLED, TARGET and HARD_CAP, so it cannot dispatch past
+  # target; one completion produces at most one replacement. The concurrency
+  # group below collapses bursts (e.g. cancelling a whole fleet at once) into a
+  # single reconcile.
+  #
+  # The cron is deliberately KEPT as a backstop: it is the only thing that can
+  # restart a fleet that has reached zero, because with no producers left there
+  # are no completion events to wake anything.
+  workflow_run:
+    workflows: ["Gartic Camoufox FLEET (supervisor-driven)"]
+    types: [completed]
+
   schedule:
     # Every 20 minutes, NOT every 5 — the short cadence starved this supervisor
     # of the very runner it needs to do its job.
