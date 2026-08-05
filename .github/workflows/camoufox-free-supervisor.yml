@@ -66,6 +66,77 @@ run-name: supervisor (target=${{ vars.CAMOUFOX_FLEET_TARGET }} enabled=${{ vars.
 #  an empty credential, skips the check, and behaves exactly as it did before.
 #
 # ============================================================================
+#  THE DISPATCH CREDENTIAL — WHY A PAT, AND WHY THE CHAIN DIED WITHOUT ONE
+# ============================================================================
+#
+#  GitHub does not raise workflow-triggering events for actions performed with
+#  the default `GITHUB_TOKEN`. So a supervisor that dispatches with it builds a
+#  chain exactly ONE generation deep: a producer the operator dispatched wakes
+#  this supervisor when it ends, but the replacement this supervisor dispatches
+#  ends SILENTLY — no event, no wake, no successor — and the fleet is left to
+#  the `schedule:` cron, which has been measured firing every 65-139 min on
+#  mature accounts and once not at all for 2h35m.
+#
+#  Measured, not inferred (2026-08-05, one fleet account, the two arms 15m42s
+#  apart in one window, the credential the only varying factor — the write-up
+#  is kept off this file because it ships into every fleet repo, and the repos
+#  are public):
+#
+#    arm G  producer dispatched with GITHUB_TOKEN  -> NO supervisor run of any
+#                                                     kind in the 6m14s after it
+#                                                     completed
+#    arm U  producer dispatched with a user token  -> supervisor woke on
+#                                                     `workflow_run` in 3 s
+#
+#  Hence: this job prefers a per-account fine-grained PAT and falls back to the
+#  default token when the secret is absent, so an account that has not been
+#  given a PAT keeps behaving EXACTLY as it does today rather than failing shut.
+#
+#  ── OPERATOR PREREQUISITE. Only you can do this; an agent cannot.
+#
+#    Create, PER ACCOUNT, a fine-grained PAT scoped to *Actions: read and
+#    write*, restricted to that account's fleet repo ONLY, and store it as a
+#    repo secret named FLEET_DISPATCH_PAT:
+#
+#      gh secret set FLEET_DISPATCH_PAT -R <owner>/<repo> -b '<the PAT>'
+#
+#    The PAT is used for READS as well as dispatches. That is deliberate:
+#    threading two credentials through fleet_master.py buys nothing, and the
+#    scope dispatch needs already covers the reads.
+#
+#  ── RECORD THIS REPO'S PAT EXPIRY HERE WHEN YOU ISSUE ONE, and keep the
+#    four-account ledger in the ticket, NOT here: this file is uploaded verbatim
+#    into every fleet repo and those repos are public, so a list of the sibling
+#    accounts in it would cross-link them to anyone who reads one.
+#
+#      PAT issued: ____________   expires: ____________
+#
+#    An EXPIRED PAT is the one failure this fallback does not absorb — it is
+#    non-empty, so it is preferred, and every API call the planner makes then
+#    401s. That is loud rather than silent: `fleet_master.py` raises on a
+#    non-2xx and the whole tick goes RED, which breaks the "every prior run
+#    reads success" signature that made the original decay invisible. Nothing is
+#    dispatched while it lasts, so treat a red supervisor as urgent; deleting
+#    the secret restores the old behaviour immediately.
+#
+#  ── ROLLOUT is per-account and incremental — the fallback is what makes a
+#    partial rollout safe. Prove it on one account across two full producer
+#    generations before issuing three more tokens.
+#
+#  ── REVERT: delete the secret. The next tick reads an empty value and this
+#    supervisor is exactly what it was before. No upload, no commit.
+#
+#      gh secret delete FLEET_DISPATCH_PAT -R <owner>/<repo>
+#
+#  ── WHAT A PAT DOES NOT CHANGE. CAMOUFOX_FLEET_ENABLED, TARGET and HARD_CAP
+#    still govern every dispatch, so one completion still produces at most one
+#    replacement; a higher-privileged credential buys no extra runners. The
+#    `concurrency` group below still collapses a burst of completions into a
+#    single reconcile, and the `schedule:` cron stays — it is the only thing
+#    that can restart a fleet already at ZERO, because with no producers there
+#    are no completion events to wake anything.
+#
+# ============================================================================
 #
 # Why a supervisor at all, rather than a producer that dispatches its own
 # successor: a dying run's `if: always()` successor dispatch respawns faster
@@ -153,7 +224,18 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 6
     env:
-      GH_TOKEN: ${{ github.token }}
+      # ── THE ONE ASSIGNMENT THAT MAKES THE CHAIN SELF-SUSTAINING.
+      # fleet_master.py takes its credential from GH_TOKEN and uses it for every
+      # API call it makes — listing runs, reading jobs, dispatching, cancelling
+      # — so preferring the PAT here is the entire credential change.
+      #
+      # An unset secret evaluates to the empty string, which `||` treats as
+      # false, so an account with no PAT silently falls back to the default
+      # token and behaves exactly as it did before. See the header block.
+      GH_TOKEN: ${{ secrets.FLEET_DISPATCH_PAT || github.token }}
+      # "true" / "false" — the FACT of which credential is in use, and nothing
+      # else. Never expose any part of the token itself, here or in a log line.
+      FLEET_PAT_PRESENT: ${{ secrets.FLEET_DISPATCH_PAT != '' }}
     steps:
       - uses: actions/checkout@v4
 
@@ -187,6 +269,33 @@ jobs:
           RELAY_AUTH: ${{ secrets.RELAY_STATS_AUTH }}
         run: |
           set -euo pipefail
+
+          # ── TWO FACTS THAT ARE OTHERWISE ONLY ANSWERABLE BY WATCHING A FLEET
+          # FOR HOURS. The failure these fix is invisible by nature: GitHub
+          # shows this workflow `active`, every prior run reads `success`, and
+          # the producers that are left are genuinely producing, right up until
+          # somebody notices the count is 2 of 10.
+          #
+          #   1. "did the PAT actually take effect on this account?" — one line,
+          #      no token material, so it is safe in a public repo's log.
+          #   2. "is the chain firing?" — the waking event, so the run history
+          #      itself shows completion-driven ticks rather than only cron.
+          if [[ "${FLEET_PAT_PRESENT}" == "true" ]]; then
+            echo "credential: FLEET_DISPATCH_PAT (user PAT) — dispatches raise workflow_run, so the chain continues"
+          else
+            echo "credential: default GITHUB_TOKEN (no FLEET_DISPATCH_PAT secret) — dispatches raise NO events, so the chain stops after one hop"
+          fi
+          # The default env var, NOT a workflow expression: nothing from the
+          # event is interpolated into this script.
+          #
+          # (And never write an empty expression — even inside a bash comment.
+          # GitHub scans the whole `run:` block for them and rejects the file
+          # with "An expression was expected"; `yaml.safe_load` in the upload
+          # gate does not, so this shipped a workflow that would not parse and
+          # the supervisor stopped ticking entirely until it was re-uploaded.
+          # The gate now checks for it.)
+          echo "woken by: ${GITHUB_EVENT_NAME}"
+
           dry=""
           if [[ '${{ inputs.dry_run }}' == 'true' ]]; then dry="--dry-run"; fi
           # Every knob that the operator may want to turn in a hurry is a repo
