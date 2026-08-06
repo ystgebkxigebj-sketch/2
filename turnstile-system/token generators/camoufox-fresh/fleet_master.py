@@ -136,6 +136,11 @@ class Plan:
     # replacement is dispatched for them.
     stalled: list[Run] = field(default_factory=list)
     dispatch: int = 0
+    # One lifetime per dispatch, chosen so this refill's runners do not die at
+    # the same moment as each other or as the fleet they are joining. Always
+    # `len(lifetimes) == dispatch` — the stagger decides how long each runner
+    # lives, never how many run.
+    lifetimes: list[int] = field(default_factory=list)
     cancel: list[Run] = field(default_factory=list)
     reason: str = ""
     # True when the fleet is short of target and the SHORTFALL WAS CAPPED by
@@ -442,9 +447,58 @@ def classify(raw_runs: list[dict], tunnel: str, now_epoch: float) -> list[Run]:
     return sorted(out, key=lambda r: r.age)
 
 
+# Floor of the stagger band. A producer spends roughly five minutes installing
+# Camoufox, bringing up WARP and building roomverify before it mints anything.
+# At three hours that setup is ~3% of the run; below it the share climbs fast
+# and the fleet starts paying for churn instead of tokens. So the stagger may
+# shorten a life down to here and no further — it is a scheduling knob, not a
+# lifetime knob, and the configured duration always remains the ceiling.
+MIN_STAGGER_SECONDS = 10800
+
+
+def stagger_lifetimes(deaths: list[float], count: int,
+                      duration_seconds: int) -> list[int]:
+    """Lifetimes for `count` replacements, spaced away from `deaths`.
+
+    `deaths` is when each already-live runner is predicted to stop, in seconds
+    from now. Each chosen lifetime is the midpoint of the widest gap between
+    consecutive scheduled deaths inside the band, with the band edges acting as
+    boundaries — and each choice JOINS the set before the next is made, so a
+    six-runner refill spaces against itself and not merely against the fleet.
+
+    Why this exists: the supervisor used to hand every replacement the same
+    `--duration-seconds`, so each refill quietly re-synchronised the fleet it
+    was refilling. Twelve runners in two cohorts once ended within the same
+    hour, every one `success`, leaving the account at zero. A cohort death also
+    demands a burst of hosted runners at a single instant, which on 2026-08-06
+    collided with GitHub refusing to allocate them at all.
+    """
+    if count <= 0:
+        return []
+    ceiling = float(duration_seconds)
+    floor = float(MIN_STAGGER_SECONDS)
+    if ceiling <= floor:
+        # No room to stagger. The operator's knob wins outright rather than the
+        # code inventing a band on the wrong side of the setup-cost argument.
+        return [duration_seconds] * count
+
+    scheduled = sorted(d for d in deaths if floor < d < ceiling)
+    chosen: list[int] = []
+    for _ in range(count):
+        points = [floor, *scheduled, ceiling]
+        widest, best = -1.0, ceiling
+        for low, high in zip(points, points[1:]):
+            if high - low > widest:
+                widest, best = high - low, (low + high) / 2.0
+        chosen.append(int(best))
+        scheduled = sorted([*scheduled, best])
+    return chosen
+
+
 def plan_cycle(runs: list[Run], *, target: int, hard_cap: int,
                overlap_seconds: float, max_dispatch: int,
-               max_cancel: int, stalled: set[int] = frozenset()) -> Plan:
+               max_cancel: int, stalled: set[int] = frozenset(),
+               duration_seconds: int = 0) -> Plan:
     """Decide this cycle's dispatches and cancellations.
 
     A run counts toward the target until it is within `overlap_seconds` of its
@@ -484,6 +538,10 @@ def plan_cycle(runs: list[Run], *, target: int, hard_cap: int,
         room = max(0, hard_cap - alive)
         plan.dispatch = min(want, max_dispatch, room)
         plan.blocked_by_cap = room < want and room < max_dispatch
+        if duration_seconds > 0:
+            plan.lifetimes = stagger_lifetimes(
+                [r.duration - r.age for r in runs if r.duration],
+                plan.dispatch, duration_seconds)
         if plan.dispatch < want:
             plan.reason = (f"want {want} more, dispatching {plan.dispatch} "
                            f"(per-cycle cap {max_dispatch}, hard cap {hard_cap} "
@@ -503,10 +561,29 @@ def plan_cycle(runs: list[Run], *, target: int, hard_cap: int,
 
 
 class GitHubAPI:
+    # ⚠️ 2026-08-06, THE FOUR-FLEET COLLAPSE. api.github.com answers a
+    # perfectly valid workflow-dispatch with `HTTP 500 {"message":"Failed to
+    # run workflow dispatch"}` often enough to matter, and the identical call
+    # succeeds seconds later. Before this retry existed, one such 500 raised
+    # straight out of main() on dispatch 3 of 6 — so dispatches 4-6 and the
+    # whole cancel phase never happened, the tick exited 1, and the NEXT tick
+    # did exactly the same thing. Four fleets sat at 2/12, 2/12, 0/10 and 0/10
+    # for hours while every supervisor tick "worked" up to the same hiccup.
+    #
+    # A dispatch is retried even though it is a POST: the observed 500 creates
+    # NO run (verified against the run list — the failing tick produced exactly
+    # the two runs it logged), and if a retry ever did duplicate one, `hard_cap`
+    # bounds the damage to a single extra producer. An empty fleet is the far
+    # more expensive error.
+    RETRY_STATUSES = (429, 500, 502, 503, 504)
+    RETRY_BACKOFF_SECONDS = (2.0, 5.0, 12.0)
+
     def __init__(self, token: str) -> None:
         self.token = token
 
-    def request(self, method: str, path: str, body: dict | None = None):
+    def _send(self, method: str, path: str, body: dict | None):
+        """One attempt. Split out so the retry policy above is testable without
+        a network and without monkeypatching urllib."""
         data = json.dumps(body).encode("utf-8") if body is not None else None
         request = urllib.request.Request(
             f"https://api.github.com/{path}", data=data, method=method,
@@ -523,7 +600,34 @@ class GitHubAPI:
         except urllib.error.HTTPError as error:
             detail = error.read(500).decode("utf-8", errors="replace")
             raise RuntimeError(f"GitHub API HTTP {error.code}: {detail}") from error
+        except urllib.error.URLError as error:
+            # No HTTP status at all — DNS, TLS or a timeout. Transient by
+            # nature, and indistinguishable from a 503 for our purposes.
+            raise RuntimeError(f"GitHub API unreachable: {error.reason}") from error
         return json.loads(payload) if payload else {}
+
+    def request(self, method: str, path: str, body: dict | None = None):
+        last: RuntimeError | None = None
+        for delay in (*self.RETRY_BACKOFF_SECONDS, None):
+            try:
+                return self._send(method, path, body)
+            except RuntimeError as error:
+                if not self._is_transient(str(error)) or delay is None:
+                    raise
+                last = error
+                print(f"  api: {str(error)[:120]} — retrying in {delay:.0f}s",
+                      flush=True)
+                time.sleep(delay)
+        raise last                                          # unreachable
+
+    @classmethod
+    def _is_transient(cls, message: str) -> bool:
+        """A permanent answer (401 on an expired PAT, 404 on a wrong repo) must
+        raise on the first attempt: retrying it burns the tick's budget and
+        makes the loudest possible failure look like a slow one."""
+        if "unreachable" in message:
+            return True
+        return any(f"HTTP {code}:" in message for code in cls.RETRY_STATUSES)
 
     def list_runs(self, repo: str, workflow: str) -> list[dict]:
         workflow_id = urllib.parse.quote(workflow, safe="")
@@ -825,6 +929,7 @@ def main() -> int:
         max_dispatch=args.max_dispatch_per_cycle,
         max_cancel=args.max_cancel_per_cycle,
         stalled=check.stalled,
+        duration_seconds=args.duration_seconds,
     )
 
     queued = sum(r.slots for r in runs if r.status != "in_progress")
@@ -863,11 +968,16 @@ def main() -> int:
               "ceiling; they count toward the target because they will start)",
               flush=True)
 
-    for index in range(plan.dispatch):
+    # `plan.lifetimes` is one entry per dispatch. It falls back to the flat
+    # configured duration only when the planner was given no duration at all,
+    # which the supervisor never does.
+    lifetimes = plan.lifetimes or [args.duration_seconds] * plan.dispatch
+    dispatch_failures = 0
+    for index, lifetime in enumerate(lifetimes):
         inputs = {
             "tunnel": args.tunnel,
             "producers": "1",
-            "duration": str(args.duration_seconds),
+            "duration": str(lifetime),
             "token_interval": str(args.token_interval),
             "post_to_relay": str(args.post_to_relay),
             "dispatched_by": "supervisor",
@@ -875,9 +985,24 @@ def main() -> int:
         if args.dry_run:
             print(f"dry-run dispatch {index + 1}/{plan.dispatch}: {inputs}", flush=True)
             continue
-        api.dispatch(args.repo, args.workflow, args.branch, inputs)
+        # ⚠️ NEVER let one dispatch abort the rest. On 2026-08-06 a transient
+        # HTTP 500 on dispatch 3 of 6 raised out of main(), so dispatches 4-6
+        # and the cancel phase below never ran and the tick exited 1 — and the
+        # next tick failed at the same point, holding four fleets at 2/12,
+        # 2/12, 0/10 and 0/10 while relay minting fell 1198 -> 76 tok/min.
+        # `GitHubAPI.cancel` had reasoned this way about its own errors since
+        # it was written; dispatch simply never got the same treatment. The
+        # tick still ends non-zero (below) so the failure stays visible.
+        try:
+            api.dispatch(args.repo, args.workflow, args.branch, inputs)
+        except RuntimeError as error:
+            dispatch_failures += 1
+            print(f"dispatch {index + 1}/{plan.dispatch} FAILED "
+                  f"({str(error)[:160]}) — continuing with the rest", flush=True)
+            time.sleep(3)
+            continue
         print(f"dispatched {index + 1}/{plan.dispatch} "
-              f"({args.tunnel}, {args.duration_seconds}s)", flush=True)
+              f"({args.tunnel}, {lifetime}s)", flush=True)
         # A short stagger keeps the fleet's browser-startup and its WARP
         # registrations from landing in the same instant.
         time.sleep(3)
@@ -914,6 +1039,12 @@ def main() -> int:
               f"is not blocked by hard_cap, so downgrading them is enough",
               flush=True)
 
+    # Reported only after the whole cycle has run. A red tick is the signal an
+    # operator needs, but it must never be the reason a refill was skipped.
+    if dispatch_failures:
+        print(f"{dispatch_failures}/{plan.dispatch} dispatch(es) failed after "
+              f"retries; the rest of the cycle completed", flush=True)
+        return 1
     return 0
 
 
