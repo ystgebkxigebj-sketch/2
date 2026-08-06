@@ -9,7 +9,7 @@ run-name: supervisor (target=${{ vars.CAMOUFOX_FLEET_TARGET }} enabled=${{ vars.
 #
 #       curl -X PATCH -H "Authorization: Bearer $TOKEN" \
 #         -H "Accept: application/vnd.github+json" \
-#         https://api.github.com/repos/ystgebkxigebj-sketch/2/actions/variables/CAMOUFOX_FLEET_ENABLED \
+#         https://api.github.com/repos/$GITHUB_REPOSITORY/actions/variables/CAMOUFOX_FLEET_ENABLED \
 #         -d '{"name":"CAMOUFOX_FLEET_ENABLED","value":"false"}'
 #
 #     From this moment nothing new can ever be dispatched. The supervisor still
@@ -20,7 +20,7 @@ run-name: supervisor (target=${{ vars.CAMOUFOX_FLEET_TARGET }} enabled=${{ vars.
 #  2. ONLY THEN cancel the runs that are still alive:
 #
 #       curl -X POST -H "Authorization: Bearer $TOKEN" \
-#         https://api.github.com/repos/ystgebkxigebj-sketch/2/actions/runs/<ID>/cancel
+#         https://api.github.com/repos/$GITHUB_REPOSITORY/actions/runs/<ID>/cancel
 #
 #     A 409 means "already terminating" — that is success, not an error. Give it
 #     ~45 s to drain; do not retry in a loop.
@@ -51,7 +51,7 @@ run-name: supervisor (target=${{ vars.CAMOUFOX_FLEET_TARGET }} enabled=${{ vars.
 #  `productive`. It is OFF unless the secret below exists, and every ambiguity
 #  resolves to "do nothing":
 #
-#    gh secret set RELAY_STATS_AUTH -R ystgebkxigebj-sketch/2 -b '<relay X-Auth>'
+#    gh secret set RELAY_STATS_AUTH -R $GITHUB_REPOSITORY -b '<relay X-Auth>'
 #
 #  Knobs, all optional repo variables:
 #    CAMOUFOX_FLEET_STALL_SECONDS   silence that counts as stalled (default 2700)
@@ -222,7 +222,7 @@ concurrency:
   # CRON by moving to */20. But since the PAT landed, `workflow_run` is the
   # dominant trigger and it has no cadence at all: producers finish in bursts,
   # so ticks arrive minutes apart, and a tick needs ~2 min of runner queue plus
-  # ~2 min of reconcile. Measured on mohanaaaadddd-cpu, 2026-08-06 16:01-16:45Z:
+  # ~2 min of reconcile. Measured on one fleet account, 2026-08-06 16:01-16:45Z:
   # ELEVEN consecutive supervisor runs, every one `cancelled`, not one reconcile
   # completed — a livelock in which the fleet at 0/10 stayed at 0/10 while the
   # supervisor looked busy.
