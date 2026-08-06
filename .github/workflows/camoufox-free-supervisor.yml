@@ -217,7 +217,22 @@ permissions:
 
 concurrency:
   group: camoufox-free-fleet-supervisor
-  cancel-in-progress: true
+  # ⚠️ WAS `true` UNTIL 2026-08-06. The comment above diagnosed this exactly —
+  # "it assumes a tick can START within one interval" — and fixed it for the
+  # CRON by moving to */20. But since the PAT landed, `workflow_run` is the
+  # dominant trigger and it has no cadence at all: producers finish in bursts,
+  # so ticks arrive minutes apart, and a tick needs ~2 min of runner queue plus
+  # ~2 min of reconcile. Measured on mohanaaaadddd-cpu, 2026-08-06 16:01-16:45Z:
+  # ELEVEN consecutive supervisor runs, every one `cancelled`, not one reconcile
+  # completed — a livelock in which the fleet at 0/10 stayed at 0/10 while the
+  # supervisor looked busy.
+  #
+  # With `false`, GitHub still collapses a burst — it keeps at most ONE pending
+  # run per group and discards the rest — but the tick that is running gets to
+  # finish. "Always act on fresh state" survives via that queued successor,
+  # which starts from a freshly listed fleet anyway. Nothing here is
+  # order-sensitive: every tick is a full reconcile from live GitHub state.
+  cancel-in-progress: false
 
 jobs:
   reconcile:
