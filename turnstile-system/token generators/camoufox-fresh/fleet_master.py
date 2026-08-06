@@ -195,7 +195,23 @@ class Plan:
 # Only the run number is identity; everything after it is the producer's live
 # self-report and changes constantly (which is why one runner legitimately shows
 # several distinct label strings on one row).
-RUNNER_LABEL_RE = re.compile(r"^cfxheal-[a-z0-9]+-f(\d+)[a-z]*(?:-|$)")
+#
+# ⚠️ THE SEGMENT COUNT IS NOT FIXED. `CAMOUFOX_FLEET_MARK` inserts an account
+# mark ahead of the tunnel, so three of the four live fleets post
+# `cfxheal-a2-warp-f286ed` while the unmarked one posts `cfxheal-warp-f373ed`.
+# This pattern required exactly ONE segment until 2026-08-06, so every label
+# from accounts a2/a3/a4 failed to match — the minting-liveness check, the
+# thing the longest docstring in this file exists for, was silently OFF on 75%
+# of the fleet. Every producer there read `mint=never-produced`, no runner
+# could ever be classed `stalled`, and a hung producer would have held its slot
+# against `alive`/`hard_cap` forever while suppressing its own replacement.
+# Failing UNKNOWN is why this was quiet rather than destructive.
+#
+# Accept one or more dash-separated segments before the run number. Greedy
+# matching with backtracking still lands on the run number rather than on
+# anything in the self-report suffix: `cfxheal-a2-warp-f286ed-r0w0-100of40`
+# yields 286, because no later `-f<digits>` segment exists to satisfy the tail.
+RUNNER_LABEL_RE = re.compile(r"^cfxheal-(?:[a-z0-9]+-)+f(\d+)[a-z]*(?:-|$)")
 
 # Must equal the relay's `occupancyGrace` (tunnel system/relay/exits.go), which
 # is `tokenRefTTL` = 10 min. If the relay ever changes it, a shared row's bound
