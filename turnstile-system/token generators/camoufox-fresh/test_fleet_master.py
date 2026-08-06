@@ -223,6 +223,28 @@ class TestProducerIdentity:
         assert (producer_of("cfxheal-warp-f59ed-r0w0-100of40")
                 == producer_of("cfxheal-warp-f59ed-r0w0-97of40"))
 
+    def test_an_account_marked_label_is_still_attributable(self):
+        """2026-08-06: `CAMOUFOX_FLEET_MARK` puts an account segment ahead of
+        the tunnel, so three of the four live fleets post `cfxheal-a2-warp-…`.
+        The pattern demanded exactly one segment, so none of them matched and
+        the minting-liveness check was OFF on 75% of the fleet — every producer
+        read `mint=never-produced` and no hung runner could ever be caught.
+        Labels taken verbatim from /stats/exits that afternoon."""
+        assert producer_of("cfxheal-a2-warp-f286ed") == ("gh", 286)
+        assert producer_of("cfxheal-a3-warp-f165ed") == ("gh", 165)
+        assert producer_of("cfxheal-a4-warp-f153ed") == ("gh", 153)
+
+    def test_a_marked_label_with_a_self_report_still_reads_the_run_number(self):
+        """The greedy segment match must not swallow the run number and
+        capture something out of the beacon suffix instead."""
+        assert (producer_of("cfxheal-a2-warp-f286ed-r0w0-100of40")
+                == producer_of("cfxheal-a2-warp-f286ed-r0w0-97of40")
+                == ("gh", 286))
+
+    def test_the_unmarked_account_still_works(self):
+        """Account 1 carries no mark; the widened pattern must not regress it."""
+        assert producer_of("cfxheal-warp-f373ed") == ("gh", 373)
+
     def test_vm_lanes_are_not_github_runners(self):
         assert producer_of("vm-cfx4-r0w0-100of5") == ("other", "vm-cfx4")
 
