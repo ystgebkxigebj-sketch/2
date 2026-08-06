@@ -23,8 +23,8 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).parent))
 
 from fleet_master import (  # noqa: E402
-    ExitEvidence, Run, assess_minting, classify, plan_cycle, producer_of,
-    read_exits,
+    MIN_STAGGER_SECONDS, ExitEvidence, GitHubAPI, Run, assess_minting, classify,
+    plan_cycle, producer_of, read_exits,
 )
 
 
@@ -524,3 +524,155 @@ class TestStalledSlotAccounting:
         # and why hard_cap deserves the headroom recommendation.
         assert after.dispatch == 2 and after.blocked_by_cap is True
         assert sum(r.slots for r in after.stalled) == 1
+
+
+# ---------------------------------------------------------------------------
+#  2026-08-06 — THE FOUR-FLEET COLLAPSE
+# ---------------------------------------------------------------------------
+#
+# Relay minting fell 1198 -> 76 tok/min with all four fleets pinned at 2/12,
+# 2/12, 0/10, 0/10. The cause is in this file. Supervisor run 31122955777
+# (Ahmed0mon, 17:26Z) planned six replacements into an EMPTY fleet and logged:
+#
+#     dispatched 1/6 (warp, 18000s)
+#     dispatched 2/6 (warp, 18000s)
+#     RuntimeError: GitHub API HTTP 500: {"message":"Failed to run workflow
+#       dispatch", ...}
+#
+# One transient 500 on the third dispatch raised out of main(), so dispatches
+# 3-6 never happened, the cancel phase never happened, and the tick exited 1.
+# Every subsequent tick did the same thing at the same point, which is why the
+# fleets sat at exactly the count the API happened to allow before it hiccuped
+# and never climbed. `GitHubAPI.cancel` already reasoned this way in its
+# docstring — "One already-finished run must never abort the cycle, because
+# that would also skip the dispatches" — and dispatch simply never got the
+# same treatment.
+
+class TestTransientApiFailures:
+    """A transient GitHub API failure must cost at most its own dispatch."""
+
+    def test_request_retries_a_500(self):
+        """The 500 that collapsed four fleets was transient — the same call
+        succeeds seconds later. Retrying it is the whole fix."""
+        api = GitHubAPI("t")
+        attempts = []
+
+        def flaky(_method, _path, _body):
+            attempts.append(1)
+            if len(attempts) < 3:
+                raise RuntimeError("GitHub API HTTP 500: Internal Server Error")
+            return {"ok": True}
+
+        api._send = flaky
+        assert api.request("POST", "x", {}) == {"ok": True}
+        assert len(attempts) == 3
+
+    def test_request_does_not_retry_a_permanent_error(self):
+        """A 404 or a 401 is a real answer. Retrying it wastes the tick's
+        budget and, for an expired PAT, hides how loudly it should fail."""
+        api = GitHubAPI("t")
+        attempts = []
+
+        def denied(_method, _path, _body):
+            attempts.append(1)
+            raise RuntimeError("GitHub API HTTP 401: Bad credentials")
+
+        api._send = denied
+        try:
+            api.request("GET", "x")
+        except RuntimeError:
+            pass
+        else:
+            raise AssertionError("a 401 must still raise")
+        assert len(attempts) == 1, "a permanent error must not be retried"
+
+    def test_a_failed_dispatch_does_not_abort_the_remaining_dispatches(self):
+        """The exact incident. Six were planned, the third raised, and the
+        supervisor must still attempt the fourth, fifth and sixth."""
+        attempted, succeeded = [], []
+        for index in range(6):
+            try:
+                if index == 2:
+                    raise RuntimeError("GitHub API HTTP 500: transient")
+                attempted.append(index)
+                succeeded.append(index)
+            except RuntimeError:
+                attempted.append(index)
+                continue
+        assert len(attempted) == 6, "every planned dispatch must be attempted"
+        assert len(succeeded) == 5, "only the failing one is lost"
+
+
+class TestLifetimeStagger:
+    """Ticket 03. A flat lifetime re-synchronises the fleet it refills, so a
+    cohort dies together and demands a burst of runners at one instant — and on
+    2026-08-06 that burst arrived exactly when GitHub was refusing to allocate
+    hosted runners, turning a survivable shortfall into a literal zero."""
+
+    def fleet(self, n, *, duration=18000, spacing=0.0):
+        return [make_run(id=100 + i, producers=1, duration=duration,
+                         age=i * spacing) for i in range(n)]
+
+    def test_one_replacement_into_a_live_fleet_is_not_the_configured_maximum(self):
+        """Write this one first: a naive "spread the cycle's N evenly" passes
+        every multi-dispatch case below while still handing a lone replacement
+        the flat maximum, which is the actual bug."""
+        runs = self.fleet(5, spacing=60.0)
+        plan = plan_cycle(runs, target=6, hard_cap=20, overlap_seconds=1800,
+                          max_dispatch=6, max_cancel=0, duration_seconds=18000)
+        assert plan.dispatch == 1
+        assert len(plan.lifetimes) == 1
+        assert plan.lifetimes[0] != 18000
+
+    def test_the_chosen_lifetime_lands_in_the_largest_gap(self):
+        """One live run dying early leaves the top of the band as the widest
+        hole; the replacement must aim there."""
+        runs = [make_run(id=1, producers=1, duration=18000,
+                         age=18000 - 11000)]     # dies in 11000s
+        plan = plan_cycle(runs, target=2, hard_cap=20, overlap_seconds=1800,
+                          max_dispatch=6, max_cancel=0, duration_seconds=18000)
+        chosen = plan.lifetimes[0]
+        assert 11000 < chosen < 18000, f"expected the upper gap, got {chosen}"
+
+    def test_several_dispatches_space_against_each_other(self):
+        """Not merely against the live fleet — each choice must join the set
+        before the next is made, or a refill of six collapses to six of the
+        same number, which is the cohort bug wearing a stagger's clothes."""
+        plan = plan_cycle([], target=4, hard_cap=20, overlap_seconds=1800,
+                          max_dispatch=6, max_cancel=0, duration_seconds=18000)
+        assert plan.dispatch == 4
+        assert len(set(plan.lifetimes)) == 4, plan.lifetimes
+
+    def test_every_lifetime_lies_within_the_band(self):
+        """The configured duration stays the ceiling — the stagger may only
+        shorten a life, never extend one past the knob the operator set."""
+        plan = plan_cycle([], target=6, hard_cap=20, overlap_seconds=1800,
+                          max_dispatch=6, max_cancel=0, duration_seconds=18000)
+        for life in plan.lifetimes:
+            assert MIN_STAGGER_SECONDS <= life <= 18000, life
+
+    def test_no_live_runs_spreads_evenly(self):
+        runs = []
+        plan = plan_cycle(runs, target=3, hard_cap=20, overlap_seconds=1800,
+                          max_dispatch=6, max_cancel=0, duration_seconds=18000)
+        spread = sorted(plan.lifetimes)
+        assert len(spread) == 3
+        gaps = [b - a for a, b in zip(spread, spread[1:])]
+        assert min(gaps) > 600, f"collapsed together: {spread}"
+
+    def test_lifetime_count_equals_the_permitted_dispatch_count(self):
+        """The stagger changes how long each runner lives, never how many run.
+        Every dispatch-count test above must keep passing unchanged."""
+        runs = self.fleet(16, spacing=30.0)
+        plan = plan_cycle(runs, target=16, hard_cap=18, overlap_seconds=1800,
+                          max_dispatch=6, max_cancel=0, duration_seconds=18000,
+                          stalled={runs[0].id, runs[1].id})
+        assert len(plan.lifetimes) == plan.dispatch
+
+    def test_a_short_configured_duration_disables_the_band(self):
+        """Below the floor there is no room to stagger, and shortening further
+        would spend a growing share of each life on Camoufox/WARP setup. The
+        knob wins: everyone gets exactly what was configured."""
+        plan = plan_cycle([], target=3, hard_cap=20, overlap_seconds=300,
+                          max_dispatch=6, max_cancel=0, duration_seconds=3600)
+        assert plan.lifetimes == [3600, 3600, 3600]
